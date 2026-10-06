@@ -1,17 +1,34 @@
 """Persisted jobs, public schemas, and focused transactional data access."""
 
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator
-from sqlalchemy import CheckConstraint, DateTime, Enum, Index, Integer, String, func, select, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Enum,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+    select,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from distributed_cloud_scheduler.database import Base
+from distributed_cloud_scheduler.idempotency import (
+    IdempotencyConflict,
+    submission_fingerprint,
+    validate_idempotency_key,
+)
 
 MAX_PAYLOAD_BYTES = 64 * 1024
 
@@ -54,6 +71,22 @@ class Job(Base):
         CheckConstraint(
             "error_info IS NULL OR jsonb_typeof(error_info) = 'object'", name="error_info_object"
         ),
+        CheckConstraint(
+            "(idempotency_key IS NULL AND request_fingerprint IS NULL) OR "
+            "(idempotency_key IS NOT NULL AND request_fingerprint IS NOT NULL)",
+            name="idempotency_metadata_paired",
+        ),
+        CheckConstraint(
+            "idempotency_key IS NULL OR (char_length(idempotency_key) BETWEEN 1 AND 128 "
+            "AND idempotency_key !~ '[^A-Za-z0-9._:-]')",
+            name="idempotency_key_format",
+        ),
+        CheckConstraint(
+            "request_fingerprint IS NULL OR (char_length(request_fingerprint) = 64 "
+            "AND request_fingerprint ~ '^[0-9a-f]{64}$')",
+            name="request_fingerprint_format",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_jobs_idempotency_key"),
         Index("ix_jobs_created_at_id", "created_at", "id"),
         Index(
             "ix_jobs_running_lease",
@@ -89,6 +122,8 @@ class Job(Base):
     max_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=3, server_default=text("3")
     )
+    idempotency_key: Mapped[str | None] = mapped_column(String(128, collation="C"))
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64))
     claim_token: Mapped[UUID | None] = mapped_column(nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result_metadata: Mapped[dict[str, JsonValue] | None] = mapped_column(
@@ -197,6 +232,57 @@ async def create_job(session: AsyncSession, submission: JobCreate) -> Job:
         await session.flush()
         await session.refresh(job)
     return job
+
+
+@dataclass(frozen=True)
+class SubmissionResult:
+    """A committed new job or the current representation of its matching replay."""
+
+    job: Job
+    created: bool
+
+
+async def create_or_replay_job(
+    session: AsyncSession,
+    submission: JobCreate,
+    *,
+    idempotency_key: str | None = None,
+) -> SubmissionResult:
+    """Commit one job/outbox per key, resolving concurrent submissions in PostgreSQL."""
+    if idempotency_key is None:
+        return SubmissionResult(job=await create_job(session, submission), created=True)
+
+    key = validate_idempotency_key(idempotency_key)
+    fingerprint = submission_fingerprint(submission)
+    from distributed_cloud_scheduler.outbox import DispatchOutbox
+
+    async with session.begin():
+        statement = (
+            insert(Job)
+            .values(
+                type=submission.type,
+                payload=submission.payload,
+                max_attempts=submission.max_attempts,
+                idempotency_key=key,
+                request_fingerprint=fingerprint,
+            )
+            .on_conflict_do_nothing(constraint="uq_jobs_idempotency_key")
+            .returning(Job)
+        )
+        job = (await session.scalars(statement)).one_or_none()
+        created = job is not None
+        if job is not None:
+            session.add(DispatchOutbox(job_id=job.id))
+            await session.flush()
+        else:
+            # READ COMMITTED gives this separate statement a snapshot containing the
+            # winner whose uncommitted unique-index entry may have blocked our INSERT.
+            job = (
+                await session.scalars(select(Job).where(Job.idempotency_key == key))
+            ).one()
+            if job.request_fingerprint != fingerprint:
+                raise IdempotencyConflict
+    return SubmissionResult(job=job, created=created)
 
 
 async def get_job(session: AsyncSession, job_id: UUID) -> Job | None:

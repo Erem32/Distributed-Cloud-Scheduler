@@ -371,3 +371,68 @@ The [emulator](https://docs.cloud.google.com/pubsub/docs/emulator) validates SDK
 publication and push delivery locally, but lacks IAM and production guarantees.
 No database migration, automatic execution retry, submission idempotency or cloud
 provisioning is introduced by this decision.
+
+## D011 - Submission identity belongs to the job transaction
+
+**Date:** 2026-10-06
+
+**Status:** Accepted for milestone 7
+
+**Decision:** Accept one optional `Idempotency-Key` header containing 1-128 ASCII
+letters, digits or `._:-`. Keys are exact, case-sensitive and global within this
+database; no account/tenant scope exists. Retain the key while its job exists,
+without expiry or cleanup in this milestone. Store a unique nullable key and its
+SHA-256 request fingerprint on `jobs`, with paired NULL/format CHECK constraints.
+Neither field appears in public job representations.
+
+Fingerprint the validated submission including effective defaults, using compact
+UTF-8 JSON with sorted object keys. Object order, request whitespace, Unicode
+escape spelling and omitted/explicit default max_attempts are equivalent. Arrays
+remain ordered and strings exact, without Unicode normalization. Preserve parsed
+numeric representations: integer 1 differs from float 1.0 and signed float zero
+differs from unsigned float zero. Float spellings yielding the same parsed float
+match. This application canonicalization does not claim RFC 8785 compliance or
+coerce large integers to binary64. Store the original fingerprint permanently;
+JSONB normalization and later execution state must not change submission identity.
+
+Within one transaction insert the job using PostgreSQL ON CONFLICT DO NOTHING
+against the key. Only the winning insert adds an outbox obligation. After a
+conflict, read the committed key in a separate statement at READ COMMITTED and
+compare the original fingerprint. Return 201 for new jobs, 200 with current job
+state for matching replay, and sanitized 409 for differing content. Reject invalid
+or repeated header fields with 422, even when repeated values match. No-key
+submissions retain their existing independent 201 behavior.
+
+**Context:** A retry after a lost HTTP response must not create another job or
+dispatch obligation. Independent replicas must share the identity decision, and
+failure after insertion must roll back the key, job and outbox together.
+PostgreSQL READ COMMITTED can suppress an ON CONFLICT DO NOTHING insert due to a
+concurrent transaction outside the insert's snapshot. A subsequent statement sees
+its commit; a combined insert/select CTE might not. See
+[PostgreSQL isolation](https://www.postgresql.org/docs/17/transaction-iso.html) and
+[SQLAlchemy PostgreSQL upserts](https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#insert-on-conflict-upsert).
+
+**Alternatives:** Process-local key caches; a separate key table with expiration;
+SELECT-before-INSERT; a no-op upsert UPDATE; swallowing all IntegrityErrors;
+snapshotting and replaying the original HTTP response; numeric coercion that can
+erase large-integer distinctions.
+
+**Reasoning:** Nullable job metadata preserves historical submissions and uses
+the existing database transaction. A unique constraint serializes contenders
+without worker locks or a second retention lifecycle. Returning current state
+lets a replay observe execution that happened since submission, while immutable
+submission fingerprints distinguish conflicts. Existing claim tokens/leases
+already fence transport duplicates and remain the execution authority.
+
+**Consequences:** Clients should generate sufficiently unique keys, such as UUIDs,
+and reuse a key only for the same validated content. A global key is not a secret
+or an authorization mechanism. There is no time-based reuse guarantee; job deletion
+or a future retention policy would need an explicit decision. Uniqueness waits
+can add latency; transaction cancellation must release incomplete submissions.
+Retrying the same key resolves a lost or ambiguous commit response. Future
+submission fields or fingerprint changes need an explicit compatibility decision
+for existing key bindings before changing this contract.
+Migration 0005 adds only nullable metadata and constraints; downgrade removes
+idempotency bindings while preserving jobs/outbox. Duplicate deliveries across
+replicas and polling retain D010 acknowledgement behavior. No automatic execution
+retry or exactly-once external side-effect guarantee follows from submission identity.

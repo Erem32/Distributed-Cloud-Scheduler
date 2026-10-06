@@ -1,11 +1,11 @@
 # Project status
 
-- **Current milestone:** 6 - Google Pub/Sub integration (COMPLETE).
-- **Current state:** Milestones 0-6 are validated locally. The Pub/Sub dispatcher
-  publishes durable obligations; a separate bounded HTTP worker commits outcomes
-  before ACK. Windows/Linux SDK-emulator delivery and failure recovery pass.
-- **Next objective:** Milestone 7 - submission idempotency and duplicate delivery (NOT STARTED).
-- **Session boundary:** Milestone 6 is tied off; ask before starting milestone 7.
+- **Current milestone:** 7 - submission idempotency and duplicate delivery (COMPLETE).
+- **Current state:** Milestones 0-7 are validated locally. Optional submission keys
+  resolve matching replay/conflicts atomically in PostgreSQL; independent delivery
+  engines and polling preserve one owned attempt. Windows/Linux live smokes pass.
+- **Next objective:** Milestone 8 - failure and retry semantics (NOT STARTED).
+- **Session boundary:** Milestone 7 is tied off; ask before starting milestone 8.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -22,13 +22,17 @@ The supported runtime is FastAPI, PostgreSQL 17, optional bounded local polling
 workers, a Pub/Sub dispatcher CLI and a separate HTTP push worker. API/worker
 resources belong to lifespan; async SQLAlchemy sessions are
 operation-scoped. Explicit Alembic commands manage the schema; revision 0004 adds
-the transactional dispatch outbox and backfills existing active jobs. The API runs
+the transactional dispatch outbox and backfills existing active jobs; revision
+0005 adds optional unique submission keys and paired request fingerprints. The API runs
 on Windows or in a non-root Python 3.12 container. GCP has no role in local startup.
 
 The publisher boundary and ID-specific execution path are exercised by real
 PostgreSQL tests and live Google SDK/emulator HTTP delivery smokes on Windows and
 Linux. Pub/Sub settings and SDK imports stay in transport/runtime modules.
 `LocalQueue` remains an in-process test adapter, not a shared CLI broker.
+POST /jobs commits new job/outbox obligations with HTTP 201, or returns the current
+job with 200 on matching keyed replay and 409 on conflicting content. Key metadata
+is internal; database uniqueness coordinates independent API replicas.
 
 ```mermaid
 flowchart LR
@@ -159,15 +163,33 @@ flowchart LR
 
 ## 7 - Submission idempotency and duplicate delivery
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Guarantee one logical submission per key under concurrency.
 - **Tasks:** Idempotency-Key, canonical request fingerprint, PostgreSQL uniqueness,
   matching replay and conflicting-key response; strengthen worker duplicate handling.
 - **Design questions:** Key scope, retention, normalization and races; exactly-once
   external effects cannot be inferred from one DB claim.
-- **Acceptance:** Matching concurrent requests return the same job; different content
-  with one key conflicts; duplicate deliveries do not create extra owned attempts.
-- **Validation:** Real DB concurrent submissions/deliveries and conflict regression tests.
+- **Acceptance:** Optional single `Idempotency-Key` accepts 1-128 ASCII letters,
+  digits or `._:-`, with exact case-sensitive global scope and no trimming/expiry.
+  No-key submissions remain independent HTTP 201 jobs. A new keyed submission
+  returns 201; matching replay returns the same job's current representation with
+  200; different validated type/payload/max_attempts returns sanitized 409.
+  Fingerprints include defaults, sort nested object keys and preserve array/string
+  and parsed numeric representation distinctions (1 differs from 1.0; signed float
+  zero differs). Invalid/duplicate headers return 422 without creating rows.
+  Concurrent submissions leave exactly one job and one outbox obligation per key;
+  rollback or cancellation before committing an incomplete insert leaves the key
+  reusable. A lost/ambiguous commit response is resolved by retrying the same key.
+  Duplicate transport/polling claims
+  cannot add an owned attempt or replace a terminal outcome. Existing rows survive
+  migration with NULL idempotency metadata, and public responses do not expose keys/hashes.
+- **Validation:** Canonicalization/header/OpenAPI unit tests; real PostgreSQL API
+  replay/conflict and independent-app contention, observed unique-index waiting
+  behind committed/rolled-back winners, outbox failure atomicity and cancellation;
+  duplicate delivery across independent push engines and polling; migration 0005
+  upgrade/downgrade/re-upgrade preserving jobs/outbox and direct constraint tests;
+  standard checks without skips, schema drift, and live Windows/Linux API + emulator
+  replay/duplicate smokes. No cloud provisioning or execution retries in this milestone.
 
 ## 8 - Failure and retry semantics
 
@@ -317,57 +339,64 @@ flowchart LR
 
 # Current milestone details
 
-Milestone 6 keeps the existing outbox and execution rules. `pubsub_config.py`
-isolates optional transport settings; `pubsub.py` provides the async Google
-publisher with explicit RPC timeout/no hidden SDK retries; `dispatcher.py` adds
-a signal-aware CLI; `push.py` provides a dedicated worker app/CLI. The wire
-payload is exactly the 36 ASCII bytes of
-a canonical UUID; only the database supplies task type/payload. Wrapped envelopes
-must match the configured subscription and include messageId and strict base64 data.
-Allow transport metadata, but cap the entire HTTP body at 8 KiB.
+Milestone 7 adds nullable `jobs.idempotency_key` and `request_fingerprint` columns.
+A unique case-sensitive key plus paired NULL/format CHECK constraints enforce the
+database boundary; existing jobs receive NULL metadata. No separate key table,
+expiration, user scope or job deletion feature is introduced. Keys last as long
+as their jobs. Use an optional single ASCII header; reject duplicate fields even
+if their values match. Keep key/fingerprint internal to persistence.
 
-The worker reserves a process-local execution slot without waiting and applies a total request
-budget (default 45 seconds) greater than task timeout plus five seconds, reuse
-the worker task deadline/lease, and release admission even after cancellation.
-Inspect/recover only the delivered expired owner. A lost/fenced completion must
-not produce a success acknowledgement. Persisted FAILED is terminal even when
-its error is retryable; execution retry authority remains milestone 8.
+Fingerprint the validated JobCreate, including the effective max_attempts default,
+using SHA-256 of sorted-key compact UTF-8 JSON. Object order, insignificant request
+whitespace and Unicode escape spelling do not matter. Strings are exact without
+Unicode normalization, arrays remain ordered, and parsed integer/float/signed-zero
+representations stay distinct. This is an application contract, not RFC 8785;
+do not coerce large integers to binary64 or recompute hashes from normalized JSONB.
 
-Authentication belongs to a separate private Cloud Run worker service whose IAM
-validates Pub/Sub OIDC. Local HTTP/emulator tests have no authentication. Expected
-subscription validation is routing validation, not proof of sender identity.
-Future deployment must use a subscription acknowledgement deadline and Cloud Run
-request timeout of at least 60 seconds with the default budgets, and configure
-graceful shutdown/replica connection budgets. No cloud resources are provisioned here.
+Inside one transaction use PostgreSQL INSERT ... ON CONFLICT (idempotency_key)
+DO NOTHING RETURNING. Only a winning insert creates the existing outbox obligation.
+A losing insert reads the key in a separate statement at READ COMMITTED, compares
+the original fingerprint and returns current state or a conflict. A combined CTE
+can miss a concurrent winner's commit because it has one snapshot; avoid no-op
+updates and broad IntegrityError handling. Preserve create_job's existing Job return
+contract and add a focused submission result for the API's 201/200 distinction.
 
-`google-cloud-pubsub>=2.42,<3` is the added transport dependency. Optional
-`compose.pubsub.yaml` starts the local emulator; `scripts/pubsub_smoke.py` fails
-on missing prerequisites and cleans its randomized broker resources/database schema.
-The environment has
-no gcloud executable, ADC file or credential environment configuration; cloud
-IAM/delivery validation remains conditional and must not be inferred from emulator tests.
+`idempotency.py` owns pure key/fingerprint rules; `jobs.create_or_replay_job` returns
+a new/replayed SubmissionResult while preserving the existing create_job interface.
+The API validates the optional header and documents 200/201/409 in OpenAPI.
+Revision 0005 preserves job/outbox fields through upgrade and removes only metadata
+on downgrade. Duplicate evidence now covers independent push app engines, restart
+and polling without altering M6's ACK rules. No new dependency was introduced.
 
 Validation completed on 2026-10-06:
 
-- Project venv `python scripts/check.py`: Ruff passed; strict mypy passed for
-  15 source files; **392 tests passed without skips** on Windows/Python 3.13.1
-  with PostgreSQL 17. The resumed baseline also passed its original 257 tests.
-- New tests cover strict envelopes/body limits, metadata isolation, real DB refusal,
-  explicit HTTP ACK/NACKs, live duplicates, PostgreSQL row-lock contention, targeted
-  expired-owner recovery, stale completion, DB failure during finalization, request
-  deadlines/intake cancellation, bounded admission and dispatcher drain/cancellation.
-- Existing migration upgrade/downgrade/re-upgrade and active outbox backfill tests
-  pass. Host upgrade/head and host/container `alembic check` pass with no drift;
-  no schema revision was added.
-- Windows host and rebuilt Linux Python 3.12.15 image (UID 10001) both pass real
-  dispatcher CLI -> Google SDK 2.42.0 -> emulator -> live HTTP push -> PostgreSQL.
-  Calculation 42, durable controlled failure, broker duplicates/HTTP 204s and
-  malformed/unknown/oversized HTTP 400/404/413 are verified. Broker connection
-  failure leaves READY without an execution attempt; recovery marks PUBLISHED on
-  publication attempt 2 and succeeds on execution attempt 1.
-- Live worker health/readiness/OpenAPI and separate HTTP interface pass. Smokes
-  remove their isolated schemas/topics/subscriptions and child processes.
-  No cloud resources, IAM or production delivery guarantees were validated.
+- Project venv `python scripts/check.py`: Ruff passed; strict mypy passed for 16
+  source files; **490 tests passed without skips** on Windows/Python 3.13.1 and
+  PostgreSQL 17. The resumed M6 baseline also passed all 392 tests without skips.
+- Canonicalization/header/OpenAPI tests cover nested ordering, Unicode/defaults,
+  exact numeric/string distinctions, large integers, boundary keys, repeated fields,
+  sanitization and hidden metadata. Real PostgreSQL tests assert one job/outbox
+  across independent API engines, matching/conflicting submissions and terminal replay.
+- Unique-index contention is observed through pg_blocking_pids before winner
+  commit/rollback. Both matching/conflicting waiters resolve correctly. A failed
+  outbox insert and cancellation while its real INSERT is blocked roll back the
+  newly keyed job; subsequent submission succeeds with the same key.
+- Independent push engines and restarted apps preserve success/failure outcomes;
+  polling-versus-push contenders in both directions keep one execution attempt.
+- Migration 0004 -> 0005 -> 0004 -> 0005 preserves existing job/outbox snapshots,
+  including RUNNING ownership and accepted publication. Direct metadata pairing,
+  key/fingerprint format, case-sensitive uniqueness and multiple unkeyed rows pass.
+  Full migration round trips and original outbox backfill regressions pass.
+- Application DB migrated to 0005; host and rebuilt container `alembic check` find
+  no drift. Compose configuration and dependency consistency checks pass.
+- Windows host and Linux Python 3.12.15 image (UID 10001) live API/emulator smokes
+  pass keyed 201/200/409, terminal current replay, nested canonical/default matching,
+  independent no-key submissions, real SDK/push result 42 and one keyed job/outbox/
+  attempt. Existing failure/duplicate ACKs, malformed/unknown/oversized messages and
+  broker outage/publication recovery remain valid. Smokes remove their resources.
+
+Cloud credentials, IAM and provisioning remain outside this milestone. FAILED
+jobs are still terminal; execution retry authority is the next milestone's design.
 
 The roadmap is intentionally sequential. Basic atomic claiming is required before
 concurrency, and durable publication/reconciliation is required before Pub/Sub.
@@ -386,10 +415,11 @@ them and does not postpone correctness testing.
 - D007/D008: database token/lease ownership, bounded loops and graceful draining.
 - D009: transactional dispatch outbox, replayable publication and separate attempt budgets.
 - D010: separate Pub/Sub runtimes, bounded push requests and ACK after durable terminal state.
+- D011: global optional submission keys, original content fingerprints and atomic job/outbox replay.
 
 # Risks / technical debt
 
-- Milestone 6's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
+- Milestones 0-7's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
   deployment-stage validation, not evidence supplied by the emulator.
 - No cloud environment or spending authorization has been established. Cloud rollout
   must not be claimed validated from local tests.
@@ -399,8 +429,9 @@ them and does not postpone correctness testing.
   marking acceptance requires a transport whose acceptance guarantees fit deployment.
   A dispatcher must be invoked to publish/replay obligations; local tests do not
   establish a durable broker guarantee or a hosted dispatcher.
-- Outbox retention/cleanup and API submission idempotency remain future work;
-  repeated submissions currently create distinct jobs.
+- Outbox/job retention and cleanup remain future work. Keys have no expiry and
+  remain bound while jobs exist; future submission fields/fingerprint changes need
+  an explicit compatibility decision for existing key bindings.
 - At-least-once delivery does not imply exactly-once external side effects. Keep handlers
   deterministic while ownership and failure semantics are developed.
 - Host tests use Python 3.13.1; container runtime smokes use Python 3.12.15. This
@@ -408,8 +439,8 @@ them and does not postpone correctness testing.
 
 # Next actions
 
-1. Ask for authorization to begin milestone 7; do not start it before the user agrees.
-2. If authorized, define submission key/fingerprint scope and concurrent replay/conflict
-   acceptance criteria before implementing API idempotency.
-3. Preserve shared execution ownership and milestone 6's acknowledgement regressions;
-   leave automatic execution retry and cloud provisioning to their planned milestones.
+1. Ask for authorization to begin milestone 8; do not start it before the user agrees.
+2. If authorized, decide execution retry authority, attempt history, retryable versus
+   permanent failure, durable backoff and acknowledgement policy before implementation.
+3. Preserve submission identity, atomic outbox publication and shared ownership;
+   validate retry/crash races before advancing. Cloud provisioning remains milestone 15.

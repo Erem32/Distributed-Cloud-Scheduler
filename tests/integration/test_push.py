@@ -3,6 +3,7 @@
 import asyncio
 import base64
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -20,7 +21,7 @@ from distributed_cloud_scheduler.api import create_app
 from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.execution import claim_job, complete_claim, recover_expired
-from distributed_cloud_scheduler.jobs import Job, JobCreate, JobStatus, create_job
+from distributed_cloud_scheduler.jobs import Job, JobCreate, JobRead, JobStatus, create_job
 from distributed_cloud_scheduler.pubsub_config import PubSubSettings
 from distributed_cloud_scheduler.push import create_push_app
 
@@ -209,6 +210,142 @@ async def test_duplicate_while_running_nacks_and_never_executes_twice(
     assert executions == 1
     assert (await push_client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
     assert (await read_job(push_database, job_id)).attempt_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("job_type", "payload", "terminal_status"),
+    [
+        ("calculation", {"numbers": [1, 2, 3]}, JobStatus.SUCCEEDED),
+        ("controlled_failure", {"fail_until_attempt": 3}, JobStatus.FAILED),
+    ],
+)
+async def test_duplicate_across_independent_push_engines_and_restart_preserves_one_outcome(
+    push_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    job_type: str,
+    payload: dict[str, JsonValue],
+    terminal_status: JobStatus,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    executions = 0
+    execute_task = worker.execute_task
+
+    async def held_handler(
+        task_type: str, task_payload: dict[str, JsonValue], attempt: int
+    ) -> dict[str, JsonValue]:
+        nonlocal executions
+        executions += 1
+        started.set()
+        await release.wait()
+        return await execute_task(task_type, task_payload, attempt)
+
+    monkeypatch.setattr(worker, "execute_task", held_handler)
+    job_id = await submit(push_database, job_type, payload)
+    owner_app = create_push_app(
+        settings_for(push_database, worker_concurrency=1), transport_settings()
+    )
+    other_app = create_push_app(
+        settings_for(push_database, worker_concurrency=1), transport_settings()
+    )
+    async with AsyncExitStack() as resources:
+        await resources.enter_async_context(owner_app.router.lifespan_context(owner_app))
+        await resources.enter_async_context(other_app.router.lifespan_context(other_app))
+        assert owner_app.state.database.engine is not other_app.state.database.engine
+        owner_client = await resources.enter_async_context(
+            AsyncClient(transport=ASGITransport(app=owner_app), base_url="http://owner")
+        )
+        other_client = await resources.enter_async_context(
+            AsyncClient(transport=ASGITransport(app=other_app), base_url="http://other")
+        )
+        owner = asyncio.create_task(owner_client.post("/pubsub/push", json=envelope(job_id)))
+        try:
+            async with asyncio.timeout(5):
+                await started.wait()
+                duplicate = await other_client.post("/pubsub/push", json=envelope(job_id))
+            assert duplicate.status_code == 503
+            assert duplicate.json() == {"detail": "Job is not available for execution"}
+            running = await read_job(push_database, job_id)
+            assert running.status is JobStatus.RUNNING
+            assert running.attempt_count == 1
+            assert executions == 1
+        finally:
+            release.set()
+            async with asyncio.timeout(5):
+                completed = await owner
+        assert completed.status_code == 204
+        terminal = await read_job(push_database, job_id)
+        assert terminal.status is terminal_status
+        terminal_snapshot = JobRead.model_validate(terminal).model_dump()
+        assert (await other_client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
+    restarted = create_push_app(settings_for(push_database), transport_settings())
+    async with restarted.router.lifespan_context(restarted):
+        async with AsyncClient(
+            transport=ASGITransport(app=restarted), base_url="http://restart"
+        ) as client:
+            assert (await client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
+    assert executions == 1
+    assert (
+        JobRead.model_validate(await read_job(push_database, job_id)).model_dump()
+        == terminal_snapshot
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("polling_owner", [False, True])
+async def test_polling_and_push_share_ownership_and_do_not_add_duplicate_attempts(
+    push_database: Database,
+    push_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    polling_owner: bool,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    executions = 0
+
+    async def held_handler(
+        job_type: str, payload: dict[str, JsonValue], attempt: int
+    ) -> dict[str, JsonValue]:
+        nonlocal executions
+        executions += 1
+        started.set()
+        await release.wait()
+        return {"sum": 6}
+
+    monkeypatch.setattr(worker, "execute_task", held_handler)
+    job_id = await submit(push_database)
+    if polling_owner:
+        owner = asyncio.create_task(worker.run_once(push_database, settings_for(push_database)))
+    else:
+        owner = asyncio.create_task(push_client.post("/pubsub/push", json=envelope(job_id)))
+    try:
+        async with asyncio.timeout(5):
+            await started.wait()
+            if polling_owner:
+                duplicate = await push_client.post("/pubsub/push", json=envelope(job_id))
+                assert duplicate.status_code == 503
+                assert duplicate.json() == {"detail": "Job is not available for execution"}
+            else:
+                assert not await worker.run_once(push_database, settings_for(push_database))
+        running = await read_job(push_database, job_id)
+        assert running.status is JobStatus.RUNNING
+        assert running.attempt_count == 1
+        assert executions == 1
+    finally:
+        release.set()
+        async with asyncio.timeout(5):
+            completed = await owner
+    if polling_owner:
+        assert completed is True
+    else:
+        assert completed.status_code == 204
+    assert (await push_client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
+    terminal = await read_job(push_database, job_id)
+    assert terminal.status is JobStatus.SUCCEEDED
+    assert terminal.attempt_count == 1
+    assert terminal.result_metadata == {"sum": 6}
+    assert executions == 1
 
 
 @pytest.mark.asyncio

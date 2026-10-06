@@ -114,7 +114,7 @@ The eventual public API includes:
 
 | Operation | Intended purpose |
 | --- | --- |
-| `POST /jobs` | Submit a validated job, eventually with `Idempotency-Key` |
+| `POST /jobs` | Submit a validated job, optionally with `Idempotency-Key` |
 | `GET /jobs/{id}` | Inspect state and useful outcome/attempt information |
 | `GET /jobs` | List jobs with bounded pagination |
 | `POST /jobs/{id}/retry` | Retry an eligible failed/dead-lettered job |
@@ -122,6 +122,9 @@ The eventual public API includes:
 | `GET /ready` | Readiness of required dependencies |
 
 Implement interfaces incrementally. Early job submission may only persist data.
+Submission identity follows D011: matching validated content under a global key
+returns the same job's current state; different content under that key conflicts.
+The original submission fingerprint remains independent of execution state.
 Use simple tasks such as sleep, calculation, and controlled failure so platform
 behavior is measurable. An HTTP task or CPU-bound benchmark may be added only
 when its requirements justify it.

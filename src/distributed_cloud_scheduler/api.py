@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, cast
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -16,11 +16,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
+from distributed_cloud_scheduler.idempotency import (
+    IDEMPOTENCY_KEY_PATTERN,
+    IdempotencyConflict,
+    validate_idempotency_key,
+)
 from distributed_cloud_scheduler.jobs import (
     JobCreate,
     JobList,
     JobRead,
-    create_job,
+    create_or_replay_job,
     get_job,
     list_jobs,
 )
@@ -85,14 +90,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"status": "not_ready"}
         return {"status": "ready"}
 
-    @app.post("/jobs", response_model=JobRead, status_code=201)
+    @app.post(
+        "/jobs",
+        response_model=JobRead,
+        status_code=201,
+        responses={
+            200: {"model": JobRead, "description": "Matching key: current persisted job."},
+            409: {"description": "The key is already bound to different submission content."},
+            503: {"description": "Database is unavailable."},
+        },
+    )
     async def submit_job(
         submission: JobCreate,
+        request: Request,
+        response: Response,
         session: Annotated[AsyncSession, Depends(get_session)],
+        idempotency_key: Annotated[
+            str | None,
+            Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=128,
+                pattern=IDEMPOTENCY_KEY_PATTERN,
+                description=(
+                    "Optional case-sensitive global key. Matching content replays the current job; "
+                    "different content conflicts. Retained while the job exists."
+                ),
+            ),
+        ] = None,
     ) -> JobRead:
-        """Persist a pending job; execution and dispatch are separate later features."""
-        job = await create_job(session, submission)
-        return JobRead.model_validate(job)
+        """Commit a job/outbox, or replay the current job for a matching submission key."""
+        if len(request.headers.getlist("Idempotency-Key")) > 1:
+            raise HTTPException(status_code=422, detail="Supply one Idempotency-Key header")
+        if idempotency_key is not None:
+            try:
+                validate_idempotency_key(idempotency_key)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid Idempotency-Key") from None
+        try:
+            submitted = await create_or_replay_job(
+                session, submission, idempotency_key=idempotency_key
+            )
+        except IdempotencyConflict:
+            raise HTTPException(
+                status_code=409, detail="Idempotency-Key is already used for different content"
+            ) from None
+        response.status_code = 201 if submitted.created else 200
+        return JobRead.model_validate(submitted.job)
 
     @app.get(
         "/jobs/{job_id}", response_model=JobRead, responses={404: {"description": "Not found."}}

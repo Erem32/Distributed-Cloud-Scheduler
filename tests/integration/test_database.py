@@ -7,6 +7,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import NullPool
 
 from distributed_cloud_scheduler.api import create_app
@@ -39,7 +40,7 @@ def test_migration_round_trip(integration_database_url: str) -> None:
     try:
         command.upgrade(config, "head")
         with engine.connect() as connection:
-            assert MigrationContext.configure(connection).get_current_revision() == "0004"
+            assert MigrationContext.configure(connection).get_current_revision() == "0005"
             assert set(inspect(connection).get_table_names()) == {
                 "alembic_version", "jobs", "dispatch_outbox"
             }
@@ -55,7 +56,185 @@ def test_migration_round_trip(integration_database_url: str) -> None:
 
         command.upgrade(config, "head")
         with engine.connect() as connection:
-            assert MigrationContext.configure(connection).get_current_revision() == "0004"
+            assert MigrationContext.configure(connection).get_current_revision() == "0005"
+    finally:
+        engine.dispose()
+
+
+def test_idempotency_migration_preserves_jobs_and_outbox_through_round_trip(
+    integration_database_url: str,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = Config(str(project_root / "alembic.ini"))
+    engine = create_engine(integration_database_url, poolclass=NullPool)
+    job_ids = {status: uuid4() for status in ("PENDING", "RUNNING", "FAILED")}
+    try:
+        command.upgrade(config, "0004")
+        with engine.begin() as connection:
+            for status, job_id in job_ids.items():
+                connection.execute(
+                    text(
+                        "INSERT INTO jobs (id, type, payload, status) "
+                        "VALUES (:id, 'calculation', '{\"numbers\":[1,2,3]}'::jsonb, :status)"
+                    ),
+                    {"id": job_id, "status": "PENDING" if status == "RUNNING" else status},
+                )
+                connection.execute(
+                    text("INSERT INTO dispatch_outbox (id, job_id) VALUES (:id, :id)"),
+                    {"id": job_id},
+                )
+            connection.execute(
+                text(
+                    "UPDATE jobs SET status = 'RUNNING', attempt_count = 1, claim_token = :token, "
+                    "started_at = clock_timestamp(), "
+                    "lease_expires_at = clock_timestamp() + INTERVAL '60 seconds' WHERE id = :id"
+                ),
+                {"id": job_ids["RUNNING"], "token": uuid4()},
+            )
+            connection.execute(
+                text(
+                    "UPDATE dispatch_outbox SET status = 'PUBLISHED', publish_attempt_count = 2, "
+                    "published_at = clock_timestamp() WHERE job_id = :id"
+                ),
+                {"id": job_ids["RUNNING"]},
+            )
+            original_jobs = [
+                dict(row) for row in connection.execute(text("SELECT * FROM jobs ORDER BY id"))
+                .mappings()
+            ]
+            original_outbox = [
+                dict(row) for row in connection.execute(
+                    text("SELECT * FROM dispatch_outbox ORDER BY id")
+                ).mappings()
+            ]
+
+        command.upgrade(config, "0005")
+        with engine.connect() as connection:
+            migrated_jobs = [
+                dict(row) for row in connection.execute(text("SELECT * FROM jobs ORDER BY id"))
+                .mappings()
+            ]
+            for row in migrated_jobs:
+                assert row.pop("idempotency_key") is None
+                assert row.pop("request_fingerprint") is None
+            assert migrated_jobs == original_jobs
+            assert [
+                dict(row) for row in connection.execute(
+                    text("SELECT * FROM dispatch_outbox ORDER BY id")
+                ).mappings()
+            ] == original_outbox
+            assert connection.scalar(text(
+                "SELECT coll.collname FROM pg_attribute attr "
+                "JOIN pg_collation coll ON coll.oid = attr.attcollation "
+                "WHERE attr.attrelid = 'jobs'::regclass AND attr.attname = 'idempotency_key'"
+            )) == "C"
+
+        # A keyed record also retains all non-idempotency data when metadata is removed.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE jobs SET idempotency_key = 'retained:job', "
+                    "request_fingerprint = :fingerprint WHERE id = :id"
+                ),
+                {"fingerprint": "f" * 64, "id": job_ids["FAILED"]},
+            )
+        command.downgrade(config, "0004")
+        with engine.connect() as connection:
+            assert [
+                dict(row) for row in connection.execute(text("SELECT * FROM jobs ORDER BY id"))
+                .mappings()
+            ] == original_jobs
+            assert [
+                dict(row) for row in connection.execute(
+                    text("SELECT * FROM dispatch_outbox ORDER BY id")
+                ).mappings()
+            ] == original_outbox
+        command.upgrade(config, "0005")
+        with engine.connect() as connection:
+            remigrated_jobs = [
+                dict(row) for row in connection.execute(text("SELECT * FROM jobs ORDER BY id"))
+                .mappings()
+            ]
+            for row in remigrated_jobs:
+                assert row.pop("idempotency_key") is None
+                assert row.pop("request_fingerprint") is None
+            assert remigrated_jobs == original_jobs
+            assert [
+                dict(row) for row in connection.execute(
+                    text("SELECT * FROM dispatch_outbox ORDER BY id")
+                ).mappings()
+            ] == original_outbox
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("key", "fingerprint"),
+    [
+        (None, "a" * 64),
+        ("key", None),
+        ("", "a" * 64),
+        (" ", "a" * 64),
+        ("a\n", "a" * 64),
+        ("é", "a" * 64),
+        ("comma,key", "a" * 64),
+        ("key", ""),
+        ("key", "a" * 63),
+        ("key", "A" * 64),
+        ("key", "g" * 64),
+        ("key", "a" * 63 + "\n"),
+    ],
+)
+def test_idempotency_database_constraints_reject_invalid_metadata(
+    integration_database_url: str, key: str | None, fingerprint: str | None,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = Config(str(project_root / "alembic.ini"))
+    engine = create_engine(integration_database_url, poolclass=NullPool)
+    try:
+        command.upgrade(config, "head")
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO jobs "
+                        "(id, type, payload, idempotency_key, request_fingerprint) "
+                        "VALUES (:id, 'calculation', '{}'::jsonb, :key, :fingerprint)"
+                    ),
+                    {"id": uuid4(), "key": key, "fingerprint": fingerprint},
+                )
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT COUNT(*) FROM jobs")) == 0
+    finally:
+        engine.dispose()
+
+
+def test_idempotency_database_uniqueness_is_case_sensitive_and_allows_unkeyed_jobs(
+    integration_database_url: str,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    config = Config(str(project_root / "alembic.ini"))
+    engine = create_engine(integration_database_url, poolclass=NullPool)
+    insert_job = text(
+        "INSERT INTO jobs (id, type, payload, idempotency_key, request_fingerprint) "
+        "VALUES (:id, 'calculation', '{}'::jsonb, :key, :fingerprint)"
+    )
+    try:
+        command.upgrade(config, "head")
+        with engine.begin() as connection:
+            for key in (None, None, "Case", "case", "a" * 128):
+                connection.execute(
+                    insert_job,
+                    {"id": uuid4(), "key": key, "fingerprint": "a" * 64 if key else None},
+                )
+        with pytest.raises(IntegrityError) as error:
+            with engine.begin() as connection:
+                connection.execute(
+                    insert_job, {"id": uuid4(), "key": "Case", "fingerprint": "b" * 64}
+                )
+        assert error.value.orig.diag.constraint_name == "uq_jobs_idempotency_key"
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT COUNT(*) FROM jobs")) == 5
     finally:
         engine.dispose()
 

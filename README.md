@@ -3,7 +3,8 @@
 A portfolio backend project focused on explainable distributed job execution,
 PostgreSQL transactions, delivery semantics and failure recovery. Development is
 local-first and follows validated milestones. The local foundation contains a
-FastAPI API, persisted jobs, atomic local execution, durable dispatch obligations,
+FastAPI API, persisted jobs with optional submission idempotency, atomic local execution,
+durable dispatch obligations,
 PostgreSQL connectivity, explicit Alembic migrations, container setup and a
 Pub/Sub publisher/push worker validated with the local emulator. Cloud deployment
 and automatic execution retries are planned work; see the
@@ -34,6 +35,8 @@ execution ownership/outcomes. Revision 0004 adds the transactional dispatch outb
 and backfills existing PENDING, QUEUED and RUNNING jobs. Direct database polling
 and Pub/Sub push both use the same execution ownership rules. The push worker
 runs separately from the submission API so Cloud Run service IAM can protect it.
+Revision 0005 adds nullable submission keys/fingerprints and their database constraints;
+existing jobs retain their identities and execution/dispatch state.
 
 The target cloud stack is GCP Pub/Sub, Cloud Run and Cloud SQL, added after local
 execution and concurrency have been proved. See the
@@ -101,7 +104,7 @@ and deployment follow later milestones.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `POST /jobs` | `201` with a PENDING job and an atomic durable dispatch obligation; execution is separate |
+| `POST /jobs` | `201` with a new job/outbox; matching `Idempotency-Key` replay returns current job with `200`, different content returns `409` |
 | `GET /jobs/{job_id}` | Persisted job or `404`; invalid UUID returns `422` |
 | `GET /jobs` | `{items, limit, offset}`; newest first with a UUID tie-breaker |
 | `GET /health` | `200 {"status":"ok"}` without querying dependencies |
@@ -145,7 +148,7 @@ letters, digits or underscores, up to 64 characters. Payloads must be JSON objec
 and fit within 64 KiB of compact UTF-8 JSON; non-finite numbers, NUL characters
 and invalid Unicode are rejected. `max_attempts` is an integer from 1 to 20
 (default 3). Extra submission fields are rejected. Stored timestamps are returned
-in UTC. Submissions are not yet idempotent: repeated requests create separate jobs.
+in UTC. Without an `Idempotency-Key`, repeated requests create separate jobs.
 
 List `limit` is 1 through 100 (default 20); `offset` is 0 through 10,000 (default
 0). Ordering is deterministic within a database snapshot; offset pages can shift
@@ -183,6 +186,48 @@ and validation error strings; readiness responses never echo database errors.
 Host commands read runtime settings from `.env`. Compose passes the internal
 database URL to containers; pass other runtime overrides explicitly, for example
 `docker compose run --rm -e WORKER_CONCURRENCY=3 api python -m distributed_cloud_scheduler.worker`.
+
+## Submission idempotency
+
+`POST /jobs` accepts one optional `Idempotency-Key` header: 1-128 ASCII letters,
+digits or `._:-`. Keys are exact, case-sensitive and global within the database.
+Whitespace, empty values, non-ASCII characters and repeated header fields return
+422; the service does not trim or merge keys. Generate a unique key for each
+logical submission, then reuse it when retrying that submission.
+
+A new key returns 201 and atomically commits one job and one outbox obligation.
+Matching replay returns 200 with the same job's current state, including any
+completed result or failure. Reusing a key for different type, payload or
+`max_attempts` returns sanitized 409. Concurrent API replicas coordinate through
+PostgreSQL uniqueness; replay creates no new job/outbox or execution attempt.
+Rolled-back submissions, including cancellation during an unfinished insert,
+leave the key reusable. If a response is lost or commit acceptance is ambiguous,
+retry the same key to resolve whether the job committed.
+
+Content matching uses SHA-256 of the validated request, including defaults, with
+sorted nested object keys and compact UTF-8 JSON. Object order, whitespace,
+Unicode escaping and omitted versus explicit `max_attempts: 3` match. Array order
+and exact strings matter; Unicode is not normalized. Parsed numeric representation
+also matters: integer `1` differs from float `1.0`, and `-0.0` differs from `0.0`.
+Float spellings that parse identically match. Large integers retain their precision.
+The original fingerprint is stored independently of later JSONB/execution changes.
+
+Keys remain bound while their jobs exist; there is no expiry or deletion/retention
+feature yet. Keys and fingerprints are internal and are absent from job responses.
+Global keys provide no access control. Submission identity and database ownership
+do not establish exactly-once external side effects; current handlers are deterministic.
+
+Example retry using the same generated key:
+
+```powershell
+$headers = @{ 'Idempotency-Key' = [guid]::NewGuid().ToString() }
+$body = '{"type":"calculation","payload":{"numbers":[1,2,3]}}'
+Invoke-RestMethod -Uri http://127.0.0.1:8000/jobs -Method Post -Headers $headers -ContentType 'application/json' -Body $body
+Invoke-RestMethod -Uri http://127.0.0.1:8000/jobs -Method Post -Headers $headers -ContentType 'application/json' -Body $body
+```
+
+Swagger exposes the optional header and the 200/201/409 responses. See
+[D011](docs/DECISIONS.md) for the transaction and normalization choices.
 
 ## Local execution semantics
 
@@ -309,9 +354,11 @@ $env:PUBSUB_EMULATOR_HOST = '127.0.0.1:8681'
 python scripts/pubsub_smoke.py --push-host host.docker.internal
 ```
 
-The smoke creates a random schema, topic and push subscription, starts a live
-worker on a free port, and exercises the real dispatcher CLI/Google SDK. It verifies
-persisted results, success/failure duplicate ACKs, malformed/unknown/oversized
+The smoke creates a random schema, topic and push subscription, starts live API
+and push worker processes on free ports, and exercises the real dispatcher CLI/Google SDK.
+It verifies keyed create/replay/conflict and current-state replay after execution,
+nested object/default matching, independent no-key submissions, persisted results,
+success/failure duplicate ACKs, malformed/unknown/oversized
 requests, and durable publication recovery after a broker connection failure.
 It removes its resources and fails when prerequisites or checks fail.
 `--push-host` must be reachable from the emulator; Docker Desktop uses
@@ -362,6 +409,11 @@ upgrade/downgrade/re-upgrade round trip with active-job backfill. Integration te
 explicitly skip if no test URL is configured; skips do not validate the database
 milestone. `alembic check` checks ORM/schema drift against the migrated application
 database without changing its schema.
+
+Submission tests cover matching/conflicting requests across independent API engines,
+actual uniqueness lock waits followed by commit/rollback/cancellation, atomic
+job/outbox rollback, and unchanged current-state replay after execution. Migration
+tests preserve existing rows across the nullable idempotency metadata change.
 
 ## Engineering documents
 

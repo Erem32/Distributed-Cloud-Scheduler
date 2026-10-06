@@ -1,4 +1,4 @@
-"""Exercise real SDK publication, emulator push and PostgreSQL on Windows or Linux.
+"""Exercise live API idempotency, SDK publication and emulator push on Windows or Linux.
 
 Set TEST_DATABASE_URL to a separate database ending in _test and explicitly set
 PUBSUB_EMULATOR_HOST. Start the optional compose.pubsub.yaml emulator first. When
@@ -25,7 +25,7 @@ from uuid import UUID, uuid4
 import psycopg
 from dotenv import dotenv_values
 from psycopg import sql
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 
 from distributed_cloud_scheduler.__main__ import create_event_loop
@@ -45,12 +45,20 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
-def request(url: str, method: str = "GET", body: bytes | None = None) -> tuple[int, bytes]:
+def request(
+    url: str,
+    method: str = "GET",
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
     """Local smoke traffic bypasses proxy variables and never authenticates to cloud."""
-    headers = {"Content-Type": "application/json"} if body is not None else {}
+    request_headers = {"Content-Type": "application/json"} if body is not None else {}
+    request_headers.update(headers or {})
     opener = build_opener(ProxyHandler({}))
     try:
-        with opener.open(Request(url, data=body, method=method, headers=headers), timeout=5) as r:
+        with opener.open(
+            Request(url, data=body, method=method, headers=request_headers), timeout=5
+        ) as r:
             return r.status, r.read()
     except HTTPError as error:
         return error.code, error.read()
@@ -88,6 +96,47 @@ def stop_child(child: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         child.kill()
         child.wait(timeout=5)
+
+
+def wait_for_server(child: subprocess.Popen, server_url: str, label: str) -> None:
+    deadline = time.monotonic() + 20
+    while True:
+        require(child.poll() is None, f"Live {label} exited during startup")
+        try:
+            ready, _ = request(f"{server_url}/ready")
+            if ready == 200:
+                return
+        except (OSError, URLError):
+            pass
+        require(time.monotonic() < deadline, f"Live {label} was not ready")
+        time.sleep(0.05)
+
+
+async def api_submission(
+    api_url: str, submission: dict, key: str | None = None
+) -> tuple[int, dict]:
+    headers = {"Idempotency-Key": key} if key is not None else {}
+    status, body = await asyncio.to_thread(
+        request, f"{api_url}/jobs", "POST", json.dumps(submission).encode(), headers
+    )
+    return status, json.loads(body)
+
+
+async def public_job(api_url: str, job_id: UUID) -> dict:
+    status, body = await asyncio.to_thread(request, f"{api_url}/jobs/{job_id}")
+    require(status == 200, "Live API could not read the submitted job")
+    return json.loads(body)
+
+
+async def require_keyed_rows(database: Database, key: str, job_id: UUID) -> None:
+    async with database.session_factory() as session:
+        job_count = await session.scalar(
+            select(func.count()).select_from(Job).where(Job.idempotency_key == key)
+        )
+        outbox_count = await session.scalar(
+            select(func.count()).select_from(DispatchOutbox).where(DispatchOutbox.job_id == job_id)
+        )
+    require(job_count == 1 and outbox_count == 1, "Key replay added a job or outbox obligation")
 
 
 async def wait_for_ack(log_path: Path, expected: int) -> None:
@@ -135,13 +184,37 @@ async def exercise(
     settings: Settings,
     cloud: PubSubSettings,
     worker_url: str,
+    api_url: str,
     log_path: Path,
     environment: dict[str, str],
 ) -> None:
     database = Database(settings)
     publisher = PubSubPublisher(cloud, publish_timeout_seconds=1)
     try:
-        success_id = await submit(database, "calculation", {"numbers": [8, 13, 21]})
+        success_key = f"smoke-success:{uuid4().hex}"
+        success_submission = {"type": "calculation", "payload": {"numbers": [8, 13, 21]}}
+        replay_submission = {
+            "max_attempts": 3,
+            "payload": {"numbers": [8, 13, 21]},
+            "type": "calculation",
+        }
+        status, created = await api_submission(api_url, success_submission, success_key)
+        require(status == 201 and created.get("status") == "PENDING", "Keyed API create failed")
+        success_id = UUID(created["id"])
+        status, replayed = await api_submission(api_url, replay_submission, success_key)
+        require(status == 200 and replayed == created, "Matching API replay did not return its job")
+        status, conflict = await api_submission(
+            api_url, {"type": "calculation", "payload": {"numbers": [99]}}, success_key
+        )
+        require(
+            status == 409 and success_key not in json.dumps(conflict),
+            "Conflicting submission did not return a sanitized HTTP 409",
+        )
+        await require_keyed_rows(database, success_key, success_id)
+        require(
+            (await read_job(database, success_id)).attempt_count == 0,
+            "API replay consumed an execution attempt",
+        )
         require(
             (await read_outbox(database, success_id)).status is DispatchStatus.READY,
             "Submission did not persist its READY obligation",
@@ -168,14 +241,29 @@ async def exercise(
             row.status is DispatchStatus.PUBLISHED and row.publish_attempt_count == 1,
             "Real broker acceptance was not persisted",
         )
+        terminal = await public_job(api_url, success_id)
+        status, replayed = await api_submission(api_url, replay_submission, success_key)
+        require(
+            status == 200 and replayed == terminal and replayed.get("status") == "SUCCEEDED",
+            "Terminal API replay did not return the job's current representation",
+        )
         acknowledgements = acknowledged_pushes(log_path)
         await publisher.publish(success_id)
         await wait_for_ack(log_path, acknowledgements + 1)
         require(
-            (await read_job(database, success_id)).attempt_count == 1,
-            "Broker duplicate changed the successful execution attempt",
+            await public_job(api_url, success_id) == terminal,
+            "Broker duplicate changed the successful job representation",
         )
-        print("PASS: SDK -> emulator -> HTTP push -> persisted result; duplicate ACK", flush=True)
+        await require_keyed_rows(database, success_key, success_id)
+        row = await read_outbox(database, success_id)
+        require(
+            row.status is DispatchStatus.PUBLISHED and row.publish_attempt_count == 1,
+            "Submission replay or broker duplicate added a publication attempt",
+        )
+        print(
+            "PASS: live API create/replay/conflict -> SDK -> emulator -> push; terminal replay/ACK",
+            flush=True,
+        )
 
         failed_id = await submit(database, "controlled_failure", {"fail_until_attempt": 1})
         acknowledgements = acknowledged_pushes(log_path)
@@ -267,6 +355,48 @@ async def exercise(
             "Recovered publication did not execute exactly one owned attempt",
         )
         print("PASS: broker outage stays READY; real SDK retry succeeds", flush=True)
+
+        # Leave these jobs pending so they cannot change the fault checks' dispatch ordering.
+        nested_key = f"smoke-nested:{uuid4().hex}"
+        status, nested_created = await api_submission(
+            api_url,
+            {"type": "custom_probe", "payload": {"b": 2, "a": {"y": 4, "x": 3}}},
+            nested_key,
+        )
+        require(status == 201, "Live API did not accept the nested JSON submission")
+        status, nested_replayed = await api_submission(
+            api_url,
+            {
+                "payload": {"a": {"x": 3, "y": 4}, "b": 2},
+                "max_attempts": 3,
+                "type": "custom_probe",
+            },
+            nested_key,
+        )
+        require(
+            status == 200 and nested_replayed == nested_created,
+            "Live API did not normalize nested key order and the default attempt limit",
+        )
+        await require_keyed_rows(database, nested_key, UUID(nested_created["id"]))
+        no_key_results = await asyncio.gather(
+            api_submission(api_url, success_submission),
+            api_submission(api_url, success_submission),
+        )
+        require(
+            all(status == 201 for status, _ in no_key_results)
+            and no_key_results[0][1]["id"] != no_key_results[1][1]["id"],
+            "No-key submissions were not independent HTTP 201 jobs",
+        )
+        for _, created in no_key_results:
+            independent_id = UUID(created["id"])
+            require(
+                (await read_job(database, independent_id)).attempt_count == 0
+                and (await read_outbox(database, independent_id)).status is DispatchStatus.READY,
+                "No-key API submission did not leave its independent dispatch obligation",
+            )
+        print(
+            "PASS: nested canonical replay and independent no-key live API submissions", flush=True
+        )
     finally:
         await publisher.close()
         await database.dispose()
@@ -317,6 +447,7 @@ def main() -> int:
     with psycopg.connect(connection_url, autocommit=True, connect_timeout=5) as connection:
         connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
         child = None
+        api_child = None
         created_resources: list[str] = []
         try:
             isolated_url = url.update_query_dict({"options": f"-csearch_path={schema}"})
@@ -341,13 +472,17 @@ def main() -> int:
                 env=environment,
                 check=True,
             )
-            with socket.socket() as listener:
+            with socket.socket() as listener, socket.socket() as api_listener:
                 listener.bind(("127.0.0.1", 0))
                 port = listener.getsockname()[1]
+                api_listener.bind(("127.0.0.1", 0))
+                api_port = api_listener.getsockname()[1]
             worker_url = f"http://127.0.0.1:{port}"
+            api_url = f"http://127.0.0.1:{api_port}"
             with tempfile.TemporaryDirectory(prefix="scheduler-pubsub-smoke-") as temp_dir:
                 log_path = Path(temp_dir) / "push.log"
-                with log_path.open("wb") as output:
+                api_log_path = Path(temp_dir) / "api.log"
+                with log_path.open("wb") as output, api_log_path.open("wb") as api_output:
                     child = subprocess.Popen(
                         [
                             sys.executable,
@@ -366,17 +501,27 @@ def main() -> int:
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                     )
                     try:
-                        deadline = time.monotonic() + 20
-                        while True:
-                            require(child.poll() is None, "Live push worker exited during startup")
-                            try:
-                                ready, _ = request(f"{worker_url}/ready")
-                                if ready == 200:
-                                    break
-                            except (OSError, URLError):
-                                pass
-                            require(time.monotonic() < deadline, "Live push worker was not ready")
-                            time.sleep(0.05)
+                        wait_for_server(child, worker_url, "push worker")
+                        api_child = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-m",
+                                "distributed_cloud_scheduler",
+                                "--host",
+                                "127.0.0.1",
+                                "--port",
+                                str(api_port),
+                            ],
+                            cwd=PROJECT_ROOT,
+                            env=environment,
+                            stdin=subprocess.DEVNULL,
+                            stdout=api_output,
+                            stderr=subprocess.STDOUT,
+                            creationflags=(
+                                subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                            ),
+                        )
+                        wait_for_server(api_child, api_url, "submission API")
                         health, _ = request(f"{worker_url}/health")
                         openapi, body = request(f"{worker_url}/openapi.json")
                         require(
@@ -387,6 +532,13 @@ def main() -> int:
                         require(
                             "/pubsub/push" in paths and "/jobs" not in paths,
                             "Push runtime did not expose its separate HTTP interface",
+                        )
+                        openapi, body = request(f"{api_url}/openapi.json")
+                        require(
+                            openapi == 200
+                            and "/jobs" in json.loads(body)["paths"]
+                            and "/pubsub/push" not in json.loads(body)["paths"],
+                            "Submission API did not expose its separate HTTP interface",
                         )
                         emulator_resource(emulator_host, topic, "PUT", {})
                         created_resources.append(topic)
@@ -404,11 +556,22 @@ def main() -> int:
                         )
                         created_resources.append(subscription)
                         with asyncio.Runner(loop_factory=create_event_loop) as runner:
-                            runner.run(exercise(settings, cloud, worker_url, log_path, environment))
+                            runner.run(
+                                exercise(
+                                    settings, cloud, worker_url, api_url, log_path, environment
+                                )
+                            )
                     finally:
-                        stop_child(child)
-                        child = None
+                        try:
+                            if api_child is not None:
+                                stop_child(api_child)
+                                api_child = None
+                        finally:
+                            stop_child(child)
+                            child = None
         finally:
+            if api_child is not None:
+                stop_child(api_child)
             if child is not None:
                 stop_child(child)
             cleanup_failed = False
