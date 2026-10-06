@@ -104,8 +104,9 @@ The initial lifecycle proposal is:
 ```text
 PENDING -> QUEUED -> RUNNING -> SUCCEEDED
                        |----> RETRY_WAIT -> RUNNING (when due)
-                       |----> FAILED (permanent or exhausted)
-                       |----> DEAD_LETTERED
+                       |----> FAILED (permanent)
+                       |----> DEAD_LETTERED (retryable budget exhausted)
+FAILED / DEAD_LETTERED -> PENDING (explicit manual recovery, new generation)
 ```
 
 This is vocabulary, not a complete transition specification. Retry transitions,
@@ -114,6 +115,10 @@ before implementation. Changes to the lifecycle need a decision entry.
 D012 makes application attempts authoritative: each claim and outcome has durable
 history; transient failures commit due retry state and a new outbox obligation.
 Claims use the database due time, independently of broker deliveries.
+D013 distinguishes terminal exhaustion from permanent failure and makes manual
+recovery generation-fenced: reset the execution budget while preserving all prior
+attempts and immutable submission identity. Broker dead-letter forwarding is
+transport quarantine and cannot determine the authoritative database job state.
 
 The eventual public API includes:
 

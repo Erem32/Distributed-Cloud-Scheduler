@@ -428,7 +428,7 @@ async def test_cancellation_after_key_insert_rolls_back_job_and_key_before_retry
         (SUBMISSION, "SUCCEEDED"),
         (
             {"type": "controlled_failure", "payload": {"fail_until_attempt": 3}, "max_attempts": 1},
-            "FAILED",
+            "DEAD_LETTERED",
         ),
     ],
 )

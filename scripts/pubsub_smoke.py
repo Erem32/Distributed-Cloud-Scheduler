@@ -1,4 +1,4 @@
-"""Exercise live API identity, durable retries and emulator push on Windows or Linux.
+"""Exercise live API identity, retries, manual recovery and emulator push.
 
 Set TEST_DATABASE_URL to a separate database ending in _test and explicitly set
 PUBSUB_EMULATOR_HOST. Start the optional compose.pubsub.yaml emulator first. When
@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -26,13 +26,14 @@ from uuid import UUID, uuid4
 import psycopg
 from dotenv import dotenv_values
 from psycopg import sql
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import make_url
 
 from distributed_cloud_scheduler.__main__ import create_event_loop
 from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.dispatcher import dispatch_once
+from distributed_cloud_scheduler.execution import claim_job, recover_expired
 from distributed_cloud_scheduler.jobs import Job, JobCreate, JobStatus, create_job
 from distributed_cloud_scheduler.outbox import DispatchOutbox, DispatchStatus
 from distributed_cloud_scheduler.pubsub import PubSubPublisher
@@ -129,8 +130,9 @@ async def public_job(api_url: str, job_id: UUID) -> dict:
     return json.loads(body)
 
 
-async def public_attempts(api_url: str, job_id: UUID) -> list[dict]:
-    status, body = await asyncio.to_thread(request, f"{api_url}/jobs/{job_id}/attempts")
+async def public_attempts(api_url: str, job_id: UUID, query: str = "") -> list[dict]:
+    suffix = f"?{query}" if query else ""
+    status, body = await asyncio.to_thread(request, f"{api_url}/jobs/{job_id}/attempts{suffix}")
     require(status == 200, "Live API could not read execution attempt history")
     history = json.loads(body)
     require(isinstance(history, list), "Attempt history was not a plain ordered list")
@@ -144,6 +146,16 @@ async def public_attempts(api_url: str, job_id: UUID) -> list[dict]:
         "Attempt history exposed internal ownership or submission metadata",
     )
     return history
+
+
+async def api_retry(api_url: str, job_id: UUID, generation: int) -> tuple[int, dict]:
+    status, body = await asyncio.to_thread(
+        request,
+        f"{api_url}/jobs/{job_id}/retry",
+        "POST",
+        json.dumps({"expected_generation": generation}).encode(),
+    )
+    return status, json.loads(body)
 
 
 async def require_keyed_rows(database: Database, key: str, job_id: UUID) -> None:
@@ -342,7 +354,7 @@ async def exercise_execution_retries(
     assert waiting.next_attempt_at is not None
     acknowledgements = acknowledged_pushes(log_path)
     await dispatch_when_due(database, publisher, settings, waiting.next_attempt_at)
-    exhausted = await wait_for_outcome(database, exhausted_id, JobStatus.FAILED)
+    exhausted = await wait_for_outcome(database, exhausted_id, JobStatus.DEAD_LETTERED)
     await wait_for_ack(log_path, acknowledgements + 1)
     rows = await read_outbox_rows(database, exhausted_id)
     history = await public_attempts(api_url, exhausted_id)
@@ -351,6 +363,8 @@ async def exercise_execution_retries(
         and exhausted.next_attempt_at is None
         and exhausted.error_info is not None
         and exhausted.error_info.get("code") == "controlled_failure"
+        and exhausted.dead_letter_reason == "attempts_exhausted"
+        and exhausted.dead_lettered_at is not None
         and len(rows) == 2
         and all(row.status is DispatchStatus.PUBLISHED for row in rows)
         and [attempt.get("attempt_number") for attempt in history] == [1, 2]
@@ -366,9 +380,7 @@ async def exercise_execution_retries(
         and len(await read_outbox_rows(database, exhausted_id)) == 2,
         "An exhausted-job broker duplicate extended the attempt budget",
     )
-    print(
-        "PASS: retry exhaustion is terminal at max_attempts and duplicate ACK is stable", flush=True
-    )
+    print("PASS: exhausted retries retain dead-letter context and stable duplicate ACK", flush=True)
 
     status, created = await api_submission(api_url, {"type": "unknown_task_probe", "payload": {}})
     require(status == 201, "Live API did not accept the permanent failure probe")
@@ -384,6 +396,8 @@ async def exercise_execution_retries(
     require(
         permanent.attempt_count == 1
         and permanent.next_attempt_at is None
+        and permanent.dead_lettered_at is None
+        and permanent.dead_letter_reason is None
         and permanent.error_info == {"code": "unknown_task", "retryable": False}
         and len(rows) == 1
         and rows[0].status is DispatchStatus.PUBLISHED
@@ -393,6 +407,176 @@ async def exercise_execution_retries(
     )
     print(
         "PASS: unknown task is a permanent one-attempt failure with no retry obligation", flush=True
+    )
+
+
+async def exercise_manual_recovery(
+    database: Database,
+    publisher: PubSubPublisher,
+    settings: Settings,
+    api_url: str,
+    log_path: Path,
+    exhausted_id: UUID,
+) -> None:
+    """Recover intentional worker loss, then prove stale commands stay fenced."""
+    recovery_key = f"smoke-recovery:{uuid4().hex}"
+    submission = {"type": "calculation", "payload": {"numbers": [17, 25]}, "max_attempts": 1}
+    status, created = await api_submission(api_url, submission, recovery_key)
+    require(status == 201 and created.get("generation") == 0, "Recovery submission failed")
+    recovered_id = UUID(created["id"])
+    claim = await claim_job(database, recovered_id, settings.worker_lease_seconds)
+    require(claim is not None, "Worker-loss probe could not claim its submitted job")
+    # Deliberately expire this disposable schema's committed ownership. Production
+    # recovery must finalize that history row rather than inventing a terminal job.
+    async with database.session_factory() as session, session.begin():
+        await session.execute(
+            update(Job)
+            .where(Job.id == recovered_id)
+            .values(lease_expires_at=Job.started_at + timedelta(microseconds=1))
+        )
+    require(
+        await recover_expired(database, job_id=recovered_id) == 1,
+        "Expired worker ownership was not recovered",
+    )
+    terminal = await public_job(api_url, recovered_id)
+    prior_history = await public_attempts(api_url, recovered_id)
+    prior_rows = await read_outbox_rows(database, recovered_id)
+    require(
+        terminal.get("status") == "DEAD_LETTERED"
+        and terminal.get("generation") == 0
+        and terminal.get("attempt_count") == 1
+        and terminal.get("dead_letter_reason") == "attempts_exhausted"
+        and terminal.get("dead_lettered_at") is not None
+        and terminal.get("error_info") == {"code": "worker_lost", "retryable": True}
+        and len(prior_history) == 1
+        and prior_history[0].get("generation") == 0
+        and prior_history[0].get("status") == "FAILED"
+        and prior_history[0].get("error_info") == terminal.get("error_info")
+        and len(prior_rows) == 1
+        and prior_rows[0].status is DispatchStatus.READY,
+        "Worker-loss exhaustion did not preserve final context and its owned attempt",
+    )
+    acknowledgements = acknowledged_pushes(log_path)
+    await publisher.publish(recovered_id)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    require(
+        await public_job(api_url, recovered_id) == terminal
+        and await public_attempts(api_url, recovered_id) == prior_history,
+        "A terminal duplicate changed dead-letter context or attempt history",
+    )
+    status, reopened = await api_retry(api_url, recovered_id, 0)
+    require(
+        status == 202
+        and reopened.get("generation") == 1
+        and reopened.get("status") == "PENDING"
+        and reopened.get("attempt_count") == 0
+        and reopened.get("created_at") == created.get("created_at")
+        and reopened.get("payload") == submission["payload"]
+        and reopened.get("max_attempts") == 1
+        and all(
+            reopened.get(field) is None
+            for field in (
+                "started_at", "finished_at", "next_attempt_at", "result_metadata", "error_info",
+                "dead_lettered_at", "dead_letter_reason",
+            )
+        ),
+        "Manual recovery did not reset current state with an independent generation budget",
+    )
+    require(
+        await public_attempts(api_url, recovered_id) == prior_history,
+        "Manual retry replaced the prior generation's finalized history",
+    )
+    status, replayed = await api_submission(api_url, submission, recovery_key)
+    require(status == 200 and replayed == reopened, "Recovery changed submission identity")
+    status, _ = await api_retry(api_url, recovered_id, 0)
+    require(status == 409, "A repeated recovery command reopened the same generation twice")
+    acknowledgements = acknowledged_pushes(log_path)
+    require(
+        await dispatch_once(database, publisher, settings), "Manual recovery was not dispatched"
+    )
+    recovered = await wait_for_outcome(database, recovered_id, JobStatus.SUCCEEDED)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    history = await public_attempts(api_url, recovered_id)
+    rows = await read_outbox_rows(database, recovered_id)
+    require(
+        recovered.generation == 1
+        and recovered.attempt_count == 1
+        and recovered.result_metadata == {"sum": 42}
+        and recovered.dead_lettered_at is None
+        and recovered.dead_letter_reason is None
+        and len(history) == 2
+        and history[:1] == prior_history
+        and [(row.get("generation"), row.get("attempt_number")) for row in history]
+        == [(0, 1), (1, 1)]
+        and history[1].get("status") == "SUCCEEDED"
+        and len(rows) == 2
+        and rows[0].generation == 0
+        and rows[0].status is DispatchStatus.SKIPPED
+        and rows[0].publish_attempt_count == 0
+        and rows[1].generation == 1
+        and rows[1].status is DispatchStatus.PUBLISHED
+        and rows[1].publish_attempt_count == 1,
+        "Recovered generation did not execute once while preserving/skipping prior obligations",
+    )
+    require(
+        await public_attempts(api_url, recovered_id, "generation=0") == prior_history
+        and await public_attempts(api_url, recovered_id, "generation=1") == history[1:]
+        and await public_attempts(api_url, recovered_id, "limit=1&offset=1") == history[1:],
+        "Generation history filtering or pagination changed the retained order",
+    )
+    terminal = await public_job(api_url, recovered_id)
+    status, replayed = await api_submission(api_url, submission, recovery_key)
+    require(status == 200 and replayed == terminal, "Terminal recovery replay lost its identity")
+    acknowledgements = acknowledged_pushes(log_path)
+    await publisher.publish(recovered_id)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    require(
+        await public_job(api_url, recovered_id) == terminal
+        and await public_attempts(api_url, recovered_id) == history,
+        "A duplicate overwrote the recovered terminal generation",
+    )
+    print(
+        "PASS: worker-loss dead letter -> HTTP manual retry -> SDK/emulator/push success; "
+        "old obligation skipped, history retained, keyed replay and duplicate ACK stable",
+        flush=True,
+    )
+
+    original = await public_attempts(api_url, exhausted_id)
+    status, reopened = await api_retry(api_url, exhausted_id, 0)
+    require(
+        status == 202 and reopened.get("generation") == 1 and reopened.get("attempt_count") == 0,
+        "Manual retry did not reopen an exhausted task with a fresh attempt budget",
+    )
+    acknowledgements = acknowledged_pushes(log_path)
+    require(
+        await dispatch_once(database, publisher, settings), "Reopened failure was not dispatched"
+    )
+    exhausted = await wait_for_outcome(database, exhausted_id, JobStatus.DEAD_LETTERED)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    history = await public_attempts(api_url, exhausted_id)
+    require(
+        exhausted.generation == 1
+        and exhausted.attempt_count == 1
+        and exhausted.dead_letter_reason == "attempts_exhausted"
+        and history[:1] == original
+        and [(row.get("generation"), row.get("attempt_number")) for row in history]
+        == [(0, 1), (1, 1)]
+        and all(row.get("status") == "FAILED" for row in history),
+        "A repeatedly failed recovery lost history or extended its per-generation budget",
+    )
+    terminal = await public_job(api_url, exhausted_id)
+    row_ids = [row.id for row in await read_outbox_rows(database, exhausted_id)]
+    status, _ = await api_retry(api_url, exhausted_id, 0)
+    require(
+        status == 409
+        and await public_job(api_url, exhausted_id) == terminal
+        and await public_attempts(api_url, exhausted_id) == history
+        and [row.id for row in await read_outbox_rows(database, exhausted_id)] == row_ids,
+        "A stale recovery command reopened a later eligible terminal generation",
+    )
+    print(
+        "PASS: repeated recovery failure is bounded; stale generation command returns 409",
+        flush=True,
     )
 
 
@@ -488,7 +672,7 @@ async def exercise(
         require(
             await dispatch_once(database, publisher, settings), "Failure job was not dispatched"
         )
-        job = await wait_for_outcome(database, failed_id, JobStatus.FAILED)
+        job = await wait_for_outcome(database, failed_id, JobStatus.DEAD_LETTERED)
         await wait_for_ack(log_path, acknowledgements + 1)
         require(
             job.attempt_count == 1
@@ -506,6 +690,9 @@ async def exercise(
         print("PASS: terminal task failure and its broker duplicate are ACKed", flush=True)
 
         await exercise_execution_retries(database, publisher, settings, api_url, log_path)
+        await exercise_manual_recovery(
+            database, publisher, settings, api_url, log_path, failed_id
+        )
 
         status, _ = await asyncio.to_thread(
             request, f"{worker_url}/pubsub/push", "POST", b'{"message":{"data":"!"}}'

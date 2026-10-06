@@ -1,11 +1,11 @@
 # Project status
 
-- **Current milestone:** 8 - failure and retry semantics (COMPLETE).
-- **Current state:** Milestones 0-8 are validated locally. PostgreSQL owns bounded
-  execution retries, persisted due times and attempt history. Retry state/history/
-  outbox commit atomically; Windows/Linux live delivery smokes pass.
-- **Next objective:** Milestone 9 - dead-letter handling (NOT STARTED).
-- **Session boundary:** Milestone 8 is tied off; ask before starting milestone 9.
+- **Current milestone:** 9 - dead-letter handling (COMPLETE).
+- **Current state:** Milestones 0-9 are validated locally. Dead-letter context and
+  generation-fenced manual recovery preserve submission identity and prior history;
+  648 tests pass without skips, and Windows/Linux live delivery smokes pass.
+- **Next objective:** Milestone 10 - delayed jobs and scheduler (NOT STARTED).
+- **Session boundary:** Milestone 9 is tied off; ask before starting milestone 10.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -24,7 +24,8 @@ resources belong to lifespan; async SQLAlchemy sessions are
 operation-scoped. Explicit Alembic commands manage the schema; revision 0004 adds
 the transactional dispatch outbox and backfills existing active jobs; revision
 0005 adds optional unique submission keys and paired request fingerprints; revision
-0006 adds retry due times and attempt history. The API runs
+0006 adds retry due times and attempt history; revision 0007 adds generation fencing
+and final dead-letter context. The API runs
 on Windows or in a non-root Python 3.12 container. GCP has no role in local startup.
 
 The publisher boundary and ID-specific execution path are exercised by real
@@ -37,7 +38,11 @@ is internal; database uniqueness coordinates independent API replicas.
 Each claim inserts a history record. Transient outcomes with budget remaining
 commit RETRY_WAIT and a new delayed outbox; polling and delivery only claim due
 retries. Push ACKs committed retry intent and early duplicates, but due contention
-remains 503. GET /jobs/{id}/attempts exposes ordered history without ownership tokens.
+remains 503. GET /jobs/{id}/attempts exposes paginated generation/attempt history
+without ownership tokens. Exhausted transient errors become DEAD_LETTERED with final
+context; permanent failures remain FAILED. Explicit manual recovery compares the
+current generation and atomically opens a new budget with immediate dispatch,
+preserving immutable submission identity and every earlier attempt/obligation.
 
 ```mermaid
 flowchart LR
@@ -231,15 +236,43 @@ flowchart LR
 
 ## 9 - Dead-letter handling
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Make exhausted jobs inspectable and intentionally recoverable.
 - **Tasks:** Define application vs broker dead-letter responsibilities; persist final
   failure context; add POST /jobs/{id}/retry with explicit eligible states.
-- **Design questions:** Broker limits are not authoritative application attempt counts;
-  manual retry budget reset, ownership and idempotency.
-- **Acceptance:** Exhausted/permanent jobs have an understandable terminal state;
-  eligible manual retries enqueue safely; invalid retries are rejected.
-- **Validation:** Exhaustion, permanent error, duplicate dead-letter delivery and manual retry.
+- **Design:** PostgreSQL remains authoritative. A retryable error at the execution
+  budget limit becomes DEAD_LETTERED with reason attempts_exhausted, database-clock
+  dead_lettered_at and the final safe error/attempt record. Permanent errors remain
+  FAILED. Broker dead-letter forwarding quarantines undeliverable transport messages;
+  it never determines execution counts or changes job state. Production policy/IAM
+  provisioning remains milestone 15.
+- **Acceptance:** POST /jobs/{id}/retry accepts a strict body containing
+  expected_generation (integer 0..2147483647). Only FAILED/DEAD_LETTERED jobs with
+  that current generation may reopen. Under one row lock, increment generation,
+  reset attempt_count, current outcome/timing/ownership/dead-letter fields and insert
+  an immediate outbox obligation in one transaction; preserve type, payload,
+  max_attempts, creation time, submission key/fingerprint and all earlier history.
+  Return 202; unknown IDs return 404, stale/ineligible/overflow requests 409,
+  invalid bodies 422 and unavailable database 503. Concurrent commands have one
+  winner; repeating an old command cannot reopen a later terminal generation.
+  Generations begin at zero and have separate 1..20 attempt budgets. Claims and
+  dispatch records carry generation; stale finalization cannot alter a reopened
+  job, and old READY obligations are skipped. ID-only transport may claim the
+  current eligible generation because the database owns execution authority.
+  GET /jobs/{id}/attempts returns chronological generation/attempt history with
+  bounded limit/offset and optional generation filter; ownership tokens stay private.
+  Terminal duplicate deliveries ACK without mutation. Migration 0007 preserves
+  historical statuses/context as generation zero; unknown legacy dead-letter
+  metadata stays NULL. Downgrade refuses after any manual recovery generation exists
+  rather than deleting retained history or silently reverting reopened work.
+- **Validation:** Standard venv checks with no skips; real PostgreSQL exhaustion,
+  permanent failure/worker loss, terminal duplicate delivery, manual success and
+  repeated failure, independent-engine concurrent retry, stale CAS commands,
+  transaction rollback/cancellation, keyed replay, history pagination, old outbox
+  publication and stale-owner fencing. Migration upgrade/downgrade/re-upgrade,
+  downgrade guard including concurrent recovery and direct constraints;
+  host/container schema drift; Windows/Linux
+  live API -> SDK -> emulator -> push dead-letter/manual-recovery smokes.
 
 ## 10 - Delayed jobs and scheduler
 
@@ -365,63 +398,61 @@ flowchart LR
 
 # Current milestone details
 
-Milestone 8 implements D012 with a transport-independent RetryPolicy, RETRY_WAIT
-and next_attempt_at, job_attempts history and migration 0006. Equal jitter uses
-half/full capped exponential delay (defaults 1/60 seconds; settings 0.001-300).
-Each claim atomically increments its attempt count and records ownership. Completion
-and expired-owner recovery finalize history and commit job state plus a new
-outbox obligation available at the persisted due time. Permanent/exhausted errors
-become FAILED; old FAILED jobs remain terminal.
+Milestone 9 implements D013. Retryable execution exhaustion becomes DEAD_LETTERED
+with final safe error, database-clock timestamp and attempts_exhausted reason;
+permanent failures remain FAILED. Terminal duplicate push deliveries acknowledge
+without changing context/history. Existing retry timing and atomic history/outbox
+completion remain authoritative.
 
-Publication leaves RETRY_WAIT intact. Future old deliveries ACK durable intent;
-due contention, active ownership and failed completion request redelivery.
-Polling and ID-specific claims use the database due time. Completion samples the
-database clock after the job lock and again after flushing all outcome writes,
-rolling back if a history/outbox lock wait outlived its lease. Retry scheduling
-never relies on sleeping in a request or an in-process background timer.
+POST /jobs/{id}/retry requires expected_generation. One job row lock compares the
+current generation and eligible terminal state, then opens a new generation and
+immediate dispatch in the same transaction. It clears current outcome/timing and
+resets the original attempt budget while retaining immutable submission identity,
+earlier history and all publication records. Eight concurrent requests across
+independent API engines produce one winner. Delayed stale commands cannot reopen
+a later terminal generation. Failed/cancelled outbox insertion rolls back recovery.
 
-Public jobs expose next_attempt_at; GET /jobs/{id}/attempts returns up to 20
-ordered records without claim tokens/payloads. finished_at describes the latest
-attempt even during retry wait, and is reset on the next claim. Revision 0006
-backfills only known positive-count RUNNING ownership; completed historical
-records are not fabricated. Downgrade maps waiting retries to FAILED and removes
-timing/history, preserving other job fields and all publication records. No
-manual retry, dead-letter forwarding, general scheduling or cloud provisioning
-was introduced. No new dependency was required.
+History keys are (job_id, generation, attempt_number). Public history has bounded
+limit/offset and optional generation filtering; generations have independent 1..20
+attempt budgets. Claims and outbox records carry generation, preventing stale
+completion/publication from altering reopened work. Old ID-only messages can claim
+the current eligible generation under normal ownership rules. No old outbox lock
+is taken while holding the manual retry job lock, preserving publisher lock order.
+
+Migration 0007 preserves existing rows/statuses as generation zero and leaves
+unknown legacy dead-letter context NULL. Downgrade locks all three tables before
+checking generation and refuses positive generations before removing any schema.
+Stop runtimes for migration; completed history and recovery intent must not be
+silently collapsed. No new dependency was required.
 
 Validation completed on 2026-10-06:
 
-- Project venv python scripts/check.py: Ruff passed, strict mypy passed for 18
-  source files, and **586 tests passed without skips** on Windows/Python 3.13.1
-  with PostgreSQL 17. The resumed baseline passed 490 tests without skips.
-- Pure policy/config tests cover exponential growth, positive jitter bounds,
-  hard caps, single sampling and invalid timing; existing classification and
-  sanitization tests remain valid.
-- Real PostgreSQL tests cover transient success, permanent failure and exact
-  exhaustion at budgets 1/3/20, ordered history, atomic outcome/dispatch rollback,
-  rejected claim-history insertion, persisted early due gating and keyed replay.
-- Eight independent-engine polling/delivery contenders admit one due attempt.
-  Old publication cannot accelerate a waiting retry. Restarted push workers ACK
-  early duplicates without changing dates/history; due locked retries NACK.
-- Concurrent expired completion/recoverers finalize once; stale owners cannot
-  overwrite a new attempt. A real outbox INSERT lock wait past the lease rolls
-  back outcome/history/retry intent. Independent-process crash recovery schedules
-  durable retry and a new worker succeeds while preserving attempt accounting.
-- Migration 0005 -> 0006 -> 0005 -> 0006 preserves historical jobs/outbox and
-  backfills only known active ownership. Legacy positive-count owners complete
-  and recover through production functions after upgrade. Waiting-retry downgrade
-  and direct schedule/history/PK/FK/cascade constraints pass.
-- Application DB migrated to 0006; host and rebuilt container alembic check find
-  no drift. Compose configuration and dependency consistency checks pass.
-- Final Windows and rebuilt Linux Python 3.12.15 image (UID 10001) live
-  API -> dispatcher -> Google SDK -> emulator -> push smokes pass transient
-  RETRY_WAIT/ACK, early duplicate/due gating, success on attempt 2, exhaustion at
-  max_attempts 2, permanent unknown-task failure and ordered token-free history.
-  Earlier idempotency, failure/duplicate ACK, malformed/unknown/oversized envelope
-  and broker outage/publication recovery probes pass. Disposable resources clean up.
+- Project venv python scripts/check.py: Ruff passed, strict mypy passed for 19
+  source files and **648 tests passed without skips** in 67.03 seconds on
+  Windows/Python 3.13.1 with PostgreSQL 17. Resumed baseline: 586 tests without skips.
+- Focused PostgreSQL recovery tests pass manual success/repeated failure, legacy
+  unknown context, generation-specific automatic retries, independent-engine CAS
+  races, stale commands/owners/publishers, keyed replay, rollback/cancellation,
+  terminal duplicate ACK, skipped obsolete outbox and 25-generation pagination.
+- All 19 PostgreSQL migration cases pass: generation-zero round trips, retained
+  historical lifecycles/ownership, CHECK/PK/FK/cascade constraints and downgrade
+  refusal. A real concurrent recovery blocks downgrade at its table lock, then
+  commits; the guard observes that generation and refuses without altering schema,
+  data or revision. The full chain also upgrades/downgrades to base and re-upgrades.
+- Application migrated to 0007; host and rebuilt container schema drift checks
+  report no new operations. Compose configuration, host/container pip dependency
+  checks and the rebuilt non-root container pass.
+- Windows/Python 3.13.1 and rebuilt Linux/Python 3.12.15 (UID 10001) live
+  API -> dispatcher -> Google SDK -> emulator -> push smokes pass worker-loss
+  dead-letter context -> manual HTTP retry -> generation 1 success, preserved
+  history/filter/pagination, old obligation skipped, keyed replay, duplicate ACK,
+  repeated recovery failure and stale command 409. Existing automatic retries,
+  exhaustion/permanent classification, submission identity, negative push responses
+  and broker outage/publication recovery probes remain green. Resources clean up.
 
-Cloud IAM/provisioning remain deployment-stage validation. Manual retry and
-dead-letter responsibilities are the next milestone's design.
+Broker DLQ is transport quarantine, separate from application execution exhaustion.
+Production DLQ policy/IAM/monitoring and cloud delivery validation remain milestone
+15; the local smoke does not configure broker dead-letter forwarding.
 
 The roadmap is intentionally sequential. Basic atomic claiming is required before
 concurrency, and durable publication/reconciliation is required before Pub/Sub.
@@ -442,14 +473,15 @@ them and does not postpone correctness testing.
 - D010: separate Pub/Sub runtimes, bounded push requests and ACK after durable terminal state.
 - D011: global optional submission keys, original content fingerprints and atomic job/outbox replay.
 - D012: application attempt authority, persisted retry timing/history and atomic replacement dispatch.
+- D013: explicit dead-letter exhaustion, generation-fenced manual recovery and retained history.
 
 # Risks / technical debt
 
-- Milestones 0-8's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
+- Milestones 0-9's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
   deployment-stage validation, not evidence supplied by the emulator.
 - No cloud environment or spending authorization has been established. Cloud rollout
   must not be claimed validated from local tests.
-- Cloud IAM, dead-letter mapping, dispatcher/scheduler
+- Cloud IAM, broker DLQ operations, dispatcher/scheduler
   hosting and priority semantics still need deployment/reliability decisions.
 - `LocalQueue` loses buffered messages on process exit. The outbox is durable, but
   marking acceptance requires a transport whose acceptance guarantees fit deployment.
@@ -463,16 +495,16 @@ them and does not postpone correctness testing.
 - History begins at migration 0006; only known active ownership is backfilled.
   A legacy RUNNING record with zero attempts was never produced by application
   claims and requires investigation rather than invented history. Coordinated
-  upgrades are required; downgrade stops waiting retries and removes history/timing.
-- Milestone 9 must decide a lifetime attempt ordinal or retry generations before
-  manual budget resets; resetting attempt_count would collide with retained history.
+  upgrades are required; revision 0006 downgrade stops waiting retries and removes history/timing.
+- Milestone 9 introduces retry generations to retain history across budget resets;
+  coordinated upgrade is required, and downgrade will be refused after manual recovery.
 - Host tests use Python 3.13.1; container runtime smokes use Python 3.12.15. This
   evidence does not establish a full Python-version test matrix.
 
 # Next actions
 
-1. Ask for authorization to begin milestone 9; do not start it before the user agrees.
-2. If authorized, decide application/broker dead-letter responsibilities, manual
-   retry eligibility, history generations and budget-reset semantics before implementation.
-3. Preserve retry timing, submission identity, publication fencing and attempt
-   history through manual recovery races. Cloud provisioning remains milestone 15.
+1. Ask for authorization before starting milestone 10.
+2. If authorized, design delayed submissions and scheduler claims without changing
+   generation recovery, retry due gating or immutable submission fingerprints silently.
+3. Define scheduler acceptance/validation before implementation. Cloud provisioning
+   and broker DLQ policy/IAM remain milestone 15.

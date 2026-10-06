@@ -40,7 +40,7 @@ def test_migration_round_trip(integration_database_url: str) -> None:
     try:
         command.upgrade(config, "head")
         with engine.connect() as connection:
-            assert MigrationContext.configure(connection).get_current_revision() == "0006"
+            assert MigrationContext.configure(connection).get_current_revision() == "0007"
             assert set(inspect(connection).get_table_names()) == {
                 "alembic_version", "jobs", "dispatch_outbox", "job_attempts"
             }
@@ -56,7 +56,7 @@ def test_migration_round_trip(integration_database_url: str) -> None:
 
         command.upgrade(config, "head")
         with engine.connect() as connection:
-            assert MigrationContext.configure(connection).get_current_revision() == "0006"
+            assert MigrationContext.configure(connection).get_current_revision() == "0007"
     finally:
         engine.dispose()
 

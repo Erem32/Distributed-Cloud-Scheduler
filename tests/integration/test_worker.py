@@ -87,7 +87,14 @@ async def test_api_submission_local_execution_and_result_inspection(
 
             assert await worker.run_once(worker_database, worker_settings) is True
             job = (await client.get(f"/jobs/{job_id}")).json()
-            assert job["status"] == ("SUCCEEDED" if error is None else "FAILED")
+            expected_status = (
+                "SUCCEEDED"
+                if error is None
+                else "DEAD_LETTERED"
+                if error["retryable"]
+                else "FAILED"
+            )
+            assert job["status"] == expected_status
             assert job["attempt_count"] == 1
             assert job["result_metadata"] == result
             assert job["error_info"] == error

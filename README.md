@@ -4,7 +4,8 @@ A portfolio backend project focused on explainable distributed job execution,
 PostgreSQL transactions, delivery semantics and failure recovery. Development is
 local-first and follows validated milestones. The local foundation contains a
 FastAPI API, persisted jobs with optional submission idempotency, atomic execution,
-bounded execution retries, attempt history and durable dispatch obligations,
+bounded execution retries, dead-letter context, manual recovery, attempt history
+and durable dispatch obligations,
 PostgreSQL connectivity, explicit Alembic migrations, container setup and a
 Pub/Sub publisher/push worker validated with the local emulator. Cloud deployment
 is planned work; see the
@@ -39,6 +40,8 @@ Revision 0005 adds nullable submission keys/fingerprints and their database cons
 existing jobs retain their identities and execution/dispatch state.
 Revision 0006 adds durable retry timing and execution attempt history. Existing
 terminal jobs remain terminal; only known active ownership is backfilled.
+Revision 0007 adds recovery generations and final dead-letter context, retaining
+all existing records as generation zero without reclassifying historical failures.
 
 The target cloud stack is GCP Pub/Sub, Cloud Run and Cloud SQL, added after local
 execution and concurrency have been proved. See the
@@ -108,7 +111,8 @@ and deployment follow later milestones.
 | --- | --- |
 | `POST /jobs` | `201` with a new job/outbox; matching `Idempotency-Key` replay returns current job with `200`, different content returns `409` |
 | `GET /jobs/{job_id}` | Persisted job or `404`; invalid UUID returns `422` |
-| `GET /jobs/{job_id}/attempts` | Up to 20 known attempts in execution order; ownership tokens stay internal |
+| `GET /jobs/{job_id}/attempts` | Paginated generation/attempt history; optional `generation` filter, default limit 20 |
+| `POST /jobs/{job_id}/retry` | `202` reopens FAILED/DEAD_LETTERED with required `expected_generation`; stale/ineligible retry returns `409` |
 | `GET /jobs` | `{items, limit, offset}`; newest first with a UUID tie-breaker |
 | `GET /health` | `200 {"status":"ok"}` without querying dependencies |
 | `GET /ready` | `200 {"status":"ready"}` after a query; otherwise sanitized `503 {"status":"not_ready"}` |
@@ -132,7 +136,7 @@ docker compose run --rm api python -m distributed_cloud_scheduler.worker --once
 `--once` claims at most one PENDING, QUEUED or due RETRY_WAIT job, regardless of concurrency.
 Without it the worker polls continuously with `WORKER_CONCURRENCY` independent
 execution slots (default 1, maximum 20).
-Inspect the job again to see `SUCCEEDED` with `result_metadata`, or RETRY_WAIT/FAILED
+Inspect the job again to see `SUCCEEDED` with `result_metadata`, or RETRY_WAIT/FAILED/DEAD_LETTERED
 with classified `error_info`. Handler payload validation happens during execution;
 the submission API accepts a generic validated JSON object.
 
@@ -144,7 +148,8 @@ the submission API accepts a generic validated JSON object.
 
 Unknown types and invalid handler payloads become permanent classified failures.
 Controlled failures and timeouts schedule automatic retries while budget remains;
-permanent failures or exhaustion finish as FAILED. `--once` processes one attempt;
+permanent failures finish as FAILED and exhausted transient failures as DEAD_LETTERED.
+`--once` processes one attempt;
 run continuously to execute a retry after its due time.
 
 Task identifiers start with a lowercase ASCII letter, followed by lowercase
@@ -238,7 +243,7 @@ Swagger exposes the optional header and the 200/201/409 responses. See
 Workers select PENDING, QUEUED or due RETRY_WAIT rows in short
 `FOR UPDATE SKIP LOCKED` transactions, commit a RUNNING claim with a token/lease,
 increment the attempt count and insert its history record, then execute outside
-the transaction. Completion locks the job and rechecks its token, attempt number
+the transaction. Completion locks the job and rechecks its generation, token, attempt number
 and current database time. It checks lease validity again after outcome/history/
 outbox writes, rolling everything back if a lock wait outlived ownership.
 Claim tokens stay internal; the API returns outcome metadata and UTC timestamps.
@@ -267,9 +272,10 @@ PostgreSQL controls execution attempts. The default `max_attempts` is 3, includi
 the initial attempt, with a maximum of 20. Broker deliveries and publication
 attempts do not consume this budget. Controlled failures, handler timeouts,
 unexpected internal errors, cancellation and worker loss are retryable. Invalid
-handler payloads and unknown task types are permanent. Permanent failures and
-retryable failures at the limit become terminal FAILED; manual retry and
-dead-letter handling are planned for the next milestone.
+handler payloads and unknown task types are permanent. Permanent failures become
+FAILED; retryable failures at the limit become DEAD_LETTERED with
+`dead_letter_reason: "attempts_exhausted"`, a UTC `dead_lettered_at` and final
+`error_info`. These states remain terminal until explicitly reopened.
 
 A retryable failure with budget remaining atomically finalizes its attempt,
 changes the job to RETRY_WAIT, persists `next_attempt_at` and inserts a new outbox
@@ -292,15 +298,68 @@ the job finishes. Push acknowledges committed retry intent because the outbox
 retains the next dispatch. A lost response can cause another delivery, which
 shares the same due gating and ownership rules.
 
-`GET /jobs/{job_id}/attempts` returns an ordered JSON list with attempt number,
+`GET /jobs/{job_id}/attempts` returns an ordered JSON list with generation, attempt number,
 status, start/finish times, outcome metadata and retry time, without claim tokens
-or task payloads. No attempts returns `[]`; an unknown job returns 404. History is
+or task payloads. Sort order is generation then attempt number. `limit` is 1..100
+(default 20), `offset` is 0..10000 (default 0), and optional `generation` selects
+one nonnegative generation. No attempts returns `[]`; an unknown job returns 404. History is
 complete for claims admitted after migration 0006. Earlier completed history is
 unavailable, and only known active RUNNING ownership is backfilled. Upgrading
 does not revive existing FAILED jobs. Coordinate runtime upgrades because older
 workers cannot interpret RETRY_WAIT. Downgrading 0006 stops waiting retries as
 FAILED and removes retry timing/history, while retaining other job data and all
 outbox records. See [D012](docs/DECISIONS.md) for retry authority and acknowledgement.
+
+## Dead letters and manual recovery
+
+Inspect the job's final error and attempt history before requesting recovery.
+`POST /jobs/{job_id}/retry` requires the current `generation`, initially zero:
+
+```powershell
+$failed = Invoke-RestMethod -Uri "http://127.0.0.1:8000/jobs/$($job.id)"
+$retryBody = @{ expected_generation = $failed.generation } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/jobs/$($job.id)/retry" -Method Post -ContentType 'application/json' -Body $retryBody
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/jobs/$($job.id)/attempts?limit=20&offset=0"
+```
+
+Only FAILED and DEAD_LETTERED are eligible. A successful command returns 202 and
+atomically increments generation, resets the current attempt budget/outcome and
+commits immediate durable dispatch. Run a dispatcher or polling worker to execute
+it. Earlier history and outbox records remain; task data, max_attempts, creation
+time and submission identity remain bound to the same job. Matching submission
+key replay observes its current generation without creating another obligation.
+Each generation has its own 1..20 attempt budget. `controlled_failure` therefore
+counts from attempt 1 again and may exhaust again with the same payload.
+
+Concurrent commands for one generation have one winner. Missing jobs return 404;
+stale generation, active/succeeded state or generation integer overflow returns
+409. Missing/extra/non-integer body fields return 422; database unavailability
+returns sanitized 503. If a response is lost, GET the job to resolve whether its
+generation advanced; replaying the old command returns 409. Previous errors stay
+in history, while current error and dead-letter fields clear on recovery.
+
+Old publication completion cannot queue a different generation, and obsolete
+READY obligations are skipped. Transport still carries only job IDs: an old
+delivery can claim the current eligible generation under normal ownership rules.
+Terminal duplicates acknowledge without changing final context or history.
+
+Pub/Sub dead-letter topics quarantine messages that cannot be delivered and
+acknowledged. Broker delivery limits are approximate and independent of execution
+budgets; forwarding alone cannot establish that a database job failed. Such
+messages need inspection against authoritative job state before manual recovery.
+Production dead-letter topic/subscription policy, IAM and monitoring are deferred
+to milestone 15; local smoke does not configure broker dead-letter forwarding.
+See [D013](docs/DECISIONS.md) and Google's
+[dead-letter topic documentation](https://docs.cloud.google.com/pubsub/docs/dead-letter-topics).
+
+Migration 0007 leaves historical FAILED/DEAD_LETTERED states unchanged, including
+unknown legacy dead-letter metadata. Coordinate runtime upgrades; older binaries
+do not track recovery generations. Downgrade is allowed while every record has
+generation zero, and explicitly refused after any manual recovery generation
+exists, protecting retained attempt history and reopened jobs.
+Stop API, worker and dispatcher runtimes before migration/downgrade. Downgrade
+locks all three tables before checking generations, so an in-flight recovery must
+finish before that decision and cannot commit between the check and schema removal.
 
 ## Durable dispatch boundary
 
@@ -309,7 +368,8 @@ transaction. If either insert fails, neither persists. `dispatch_once` leases on
 due obligation, calls an async `Publisher.publish(job_id)` outside the transaction,
 then records PUBLISHED using the current token and an unexpired lease. Transport
 acceptance is separate from job success. The job becomes QUEUED only if still
-PENDING; publication never replaces RUNNING, RETRY_WAIT or a terminal execution state.
+PENDING in the obligation's generation; publication never replaces RUNNING,
+RETRY_WAIT or a terminal execution state.
 
 Failed publication keeps the obligation READY with a sanitized error code and
 exponential backoff capped by `DISPATCH_RETRY_MAX_SECONDS`. Interrupted publishers
@@ -317,7 +377,7 @@ leave a PUBLISHING lease that can be reclaimed after expiry. A crash after trans
 acceptance but before the database marker can publish the same ID again. Both
 ID-specific delivery and polling use the same database claim rules, so duplicate
 deliveries cannot claim an already RUNNING or terminal job or increase its attempts.
-Outbox rows for jobs already completed locally are explicitly SKIPPED.
+Outbox rows for terminal jobs or earlier recovery generations are explicitly SKIPPED.
 
 `LocalQueue` is a bounded, in-process test adapter with backpressure. Its messages
 do not survive process exit, and it is not a broker shared by CLI processes.
@@ -362,7 +422,7 @@ it cannot supply task data or execution attempts. Unwrapped delivery is unsuppor
 | --- | --- |
 | Committed success or classified failure; terminal duplicate | 204 ACK |
 | Committed RETRY_WAIT with replacement outbox; early retry duplicate | 204 ACK |
-| Expired target owner recovered to RETRY_WAIT or exhausted FAILED | 204 ACK |
+| Expired target owner recovered to RETRY_WAIT or exhausted DEAD_LETTERED | 204 ACK |
 | Active ownership, row contention, full capacity or rejected completion | 503, redeliver |
 | Database failure or total request timeout | 503, redeliver |
 | Unknown job ID | 404, redeliver |
@@ -370,7 +430,7 @@ it cannot supply task data or execution attempts. Unwrapped delivery is unsuppor
 
 Pub/Sub retries all these non-success responses. Unknown or malformed messages
 may therefore repeat indefinitely before a future dead-letter policy is configured.
-A FAILED job is terminal; retryable failures with budget remaining use RETRY_WAIT.
+FAILED and DEAD_LETTERED jobs are terminal; retryable failures with budget remaining use RETRY_WAIT.
 Broker delivery count does not consume or control execution attempts. A due
 RETRY_WAIT row locked by another claimant returns 503 until ownership is committed.
 
@@ -408,7 +468,9 @@ and push worker processes on free ports, and exercises the real dispatcher CLI/G
 It verifies keyed create/replay/conflict and current-state replay after execution,
 nested object/default matching, independent no-key submissions, persisted results,
 success/failure duplicate ACKs, transient retry/backoff with an early duplicate,
-success on attempt 2, bounded exhaustion, permanent failure, ordered attempt history,
+success on attempt 2, dead-letter exhaustion/context, permanent failure, generation
+history/filter/pagination, worker-loss recovery through manual retry and real
+delivery, stale retry conflicts, keyed replay and skipped obsolete obligations,
 malformed/unknown/oversized requests, and durable publication recovery after a
 broker connection failure.
 It removes its resources and fails when prerequisites or checks fail.
@@ -469,6 +531,9 @@ Retry tests cover persisted due times, competing due claims, atomic history/outb
 rollback, exhaustion/permanent classification, crash recovery, stale completions
 and current keyed replay across retries. Migration tests preserve historical state
 and explicitly validate the downgrade behavior for waiting retries.
+Recovery tests exercise concurrent manual commands, stale commands/owners/publishers,
+retained identity/history and atomic rollback/cancellation. Migration tests cover
+generation-zero round trips, dead-letter constraints and refusal of unsafe downgrade.
 
 ## Engineering documents
 

@@ -504,3 +504,73 @@ finalizer's persisted due time governs the next attempt. Clock and lock contenti
 can delay execution beyond the due time. Retries may repeat handler side effects;
 ownership fencing still does not establish exactly-once external effects. Migration
 requires coordinated runtime upgrades; old binaries cannot interpret RETRY_WAIT.
+
+## D013 - Terminal exhaustion and generation-fenced manual recovery
+
+**Date:** 2026-10-06
+
+**Status:** Accepted for milestone 9; validation evidence recorded in PLAN
+
+**Decision:** Retryable failure at max_attempts becomes DEAD_LETTERED with final
+safe error, database-clock dead_lettered_at and reason attempts_exhausted.
+Permanent failures remain FAILED. This supersedes D012's terminal exhaustion
+classification; its retry scheduling, history and acknowledgement model stays in
+effect. Attempt records describe individual execution success/failure; job state
+describes the generation's exhaustion decision.
+
+Manual recovery requires POST /jobs/{id}/retry with strict expected_generation.
+Under a job row lock, compare the generation and allow only FAILED/DEAD_LETTERED;
+increment generation, clear current ownership/outcome/timing/dead-letter context,
+reset attempt_count and insert an immediate outbox obligation atomically. Return
+202 for the winner, 409 for stale/ineligible/overflow commands, 404 for missing
+jobs and 422 for invalid bodies. Generations are nonnegative PostgreSQL integers,
+initially zero. Each has the unchanged max_attempts budget. Preserve immutable
+submission data, creation time, key/fingerprint and all earlier records. Permanent
+failures may recur until a handler fix makes the original immutable input valid.
+
+History keys are (job_id, generation, attempt_number). Read history chronologically
+with bounded limit/offset and optional generation filter. Execution claims and
+outbox obligations carry generation. Current token/lease and generation fence
+completion; an old publisher can finalize its own accepted row but cannot queue
+a reopened generation. Claiming skips obsolete publication obligations. Manual
+recovery never locks/updates old outbox rows while holding the job lock, preserving
+the existing publisher's outbox -> job lock order. ID-only delivery remains valid:
+the database authorizes the current eligible generation, irrespective of which
+publication produced a duplicate ID.
+
+Broker dead-letter topics quarantine undeliverable/unacknowledged messages.
+Pub/Sub forwarding is best effort and its attempt threshold is approximate;
+application attempt_count and terminal state never derive from that threshold.
+A lost ACK may cause forwarding after successful execution, so inspection must
+join the original job ID to current database state before any intentional recovery.
+Do not feed a wrapped forwarded message blindly back into the normal push adapter.
+Production DLQ topic/subscription/IAM/monitoring configuration belongs to milestone
+15. Google's emulator supports dead-letter forwarding, but cannot validate cloud
+IAM and production guarantees; this milestone validates application dead letters
+and manual recovery through normal live emulator delivery. See Google's
+[dead-letter responsibilities](https://docs.cloud.google.com/pubsub/docs/dead-letter-topics)
+and [emulator limitations](https://docs.cloud.google.com/pubsub/docs/emulator).
+
+**Context:** Resetting attempt_count against the former two-column history key
+would collide with previous attempts. A state-only manual retry can also accept
+an old delayed command after a newer generation fails, reopening work twice.
+
+**Alternatives:** Delete prior history; maintain one lifetime attempt ordinal;
+create a separate job for recovery; rely on broker delivery counts; add a separate
+manual-command idempotency key/cache.
+
+**Reasoning:** Generations retain bounded per-run attempt semantics and preserve
+the job's submission identity. Required generation comparison makes concurrent
+and delayed commands explicit without another identity lifecycle. A lost response
+is resolved by reading current generation; repeating the old command conflicts.
+The existing outbox retains recovery intent through restart/publication failure.
+
+**Consequences:** History/outbox retention remains future work; repeated explicit
+recovery can grow retained history. This does not promise exactly-once external
+effects. Migration 0007 preserves old records/statuses as generation zero rather
+than guessing historical exhaustion; legacy dead-letter metadata may be unknown.
+Coordinate runtime upgrades. Downgrade refuses if any job, attempt or obligation
+has positive generation, preventing history loss or silent reversal of recovery.
+Stop runtimes for schema migration. Downgrade acquires exclusive table locks before
+checking generations; the check and schema removal share one transaction, closing
+the race with an in-flight manual recovery.

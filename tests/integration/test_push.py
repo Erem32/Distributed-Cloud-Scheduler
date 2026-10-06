@@ -165,7 +165,7 @@ async def test_exhausted_task_failure_acknowledges_without_execution_retry(
     )
     assert (await push_client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
     failed = await read_job(push_database, job_id)
-    assert failed.status is JobStatus.FAILED
+    assert failed.status is JobStatus.DEAD_LETTERED
     assert failed.error_info == {"code": "controlled_failure", "retryable": True}
     assert (await push_client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
     assert (await read_job(push_database, job_id)).attempt_count == 1
@@ -225,7 +225,7 @@ async def test_duplicate_while_running_nacks_and_never_executes_twice(
     ("job_type", "payload", "terminal_status"),
     [
         ("calculation", {"numbers": [1, 2, 3]}, JobStatus.SUCCEEDED),
-        ("controlled_failure", {"fail_until_attempt": 3}, JobStatus.FAILED),
+        ("controlled_failure", {"fail_until_attempt": 3}, JobStatus.DEAD_LETTERED),
     ],
 )
 async def test_duplicate_across_independent_push_engines_and_restart_preserves_one_outcome(

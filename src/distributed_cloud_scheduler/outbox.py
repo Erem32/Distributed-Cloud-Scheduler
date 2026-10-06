@@ -44,6 +44,7 @@ class DispatchOutbox(Base):
 
     __tablename__ = "dispatch_outbox"
     __table_args__ = (
+        CheckConstraint("generation >= 0", name="generation_nonnegative"),
         CheckConstraint("publish_attempt_count >= 0", name="publish_attempt_count_range"),
         CheckConstraint(
             "(status = 'PUBLISHING' AND claim_token IS NOT NULL AND lease_expires_at IS NOT NULL) "
@@ -70,6 +71,9 @@ class DispatchOutbox(Base):
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     job_id: Mapped[UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     status: Mapped[DispatchStatus] = mapped_column(
         Enum(
             DispatchStatus,
@@ -105,10 +109,11 @@ class DispatchClaim:
     job_id: UUID
     token: UUID
     attempt_count: int
+    generation: int = 0
 
 
 async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClaim | None:
-    """Claim due or abandoned publication; skip up to 100 terminal jobs per call."""
+    """Claim due publication; skip up to 100 terminal or obsolete obligations."""
     if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
         raise ValueError("lease_seconds must be a positive integer")
     async with database.session_factory() as session, session.begin():
@@ -133,8 +138,14 @@ async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClai
             )
             if row is None:
                 return None
-            job_status = await session.scalar(select(Job.status).where(Job.id == row.job_id))
-            if job_status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.DEAD_LETTERED):
+            job = (
+                await session.execute(
+                    select(Job.status, Job.generation).where(Job.id == row.job_id)
+                )
+            ).one()
+            if job.generation != row.generation or job.status in (
+                JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.DEAD_LETTERED
+            ):
                 row.status = DispatchStatus.SKIPPED
                 row.claim_token = None
                 row.lease_expires_at = None
@@ -148,7 +159,9 @@ async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClai
             row.lease_expires_at = now + timedelta(seconds=lease_seconds)
             row.publish_attempt_count += 1
             await session.flush()
-            claim = DispatchClaim(row.id, row.job_id, token, row.publish_attempt_count)
+            claim = DispatchClaim(
+                row.id, row.job_id, token, row.publish_attempt_count, row.generation
+            )
             break
         else:
             return None
@@ -162,6 +175,7 @@ async def _lock_dispatch(session: AsyncSession, claim: DispatchClaim) -> UUID | 
         .where(
             DispatchOutbox.id == claim.id,
             DispatchOutbox.job_id == claim.job_id,
+            DispatchOutbox.generation == claim.generation,
             DispatchOutbox.status == DispatchStatus.PUBLISHING,
             DispatchOutbox.claim_token == claim.token,
         )
@@ -197,7 +211,11 @@ async def complete_dispatch(database: Database, claim: DispatchClaim) -> bool:
             return False
         await session.execute(
             update(Job)
-            .where(Job.id == claim.job_id, Job.status == JobStatus.PENDING)
+            .where(
+                Job.id == claim.job_id,
+                Job.generation == claim.generation,
+                Job.status == JobStatus.PENDING,
+            )
             .values(status=JobStatus.QUEUED)
         )
     return True

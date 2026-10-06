@@ -30,6 +30,12 @@ from distributed_cloud_scheduler.jobs import (
     get_job,
     list_jobs,
 )
+from distributed_cloud_scheduler.manual_retry import (
+    JobNotFound,
+    JobRetry,
+    RetryConflict,
+    retry_job,
+)
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -170,10 +176,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def read_attempts(
         job_id: UUID,
         session: Annotated[AsyncSession, Depends(get_session)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
+        generation: Annotated[int | None, Query(ge=0, le=2_147_483_647)] = None,
     ) -> list[AttemptRead]:
-        """Inspect up to 20 known attempts in execution order; legacy history may be absent."""
+        """Inspect paginated generation/attempt history; legacy history may be absent."""
         if await get_job(session, job_id) is None:
             raise HTTPException(status_code=404, detail="Job not found")
-        return [AttemptRead.model_validate(row) for row in await list_attempts(session, job_id)]
+        rows = await list_attempts(
+            session, job_id, limit=limit, offset=offset, generation=generation
+        )
+        return [AttemptRead.model_validate(row) for row in rows]
+
+    @app.post(
+        "/jobs/{job_id}/retry",
+        response_model=JobRead,
+        status_code=202,
+        responses={
+            404: {"description": "Job not found."},
+            409: {"description": "Stale generation or job is ineligible for manual retry."},
+            503: {"description": "Database is unavailable."},
+        },
+    )
+    async def manually_retry_job(
+        job_id: UUID,
+        recovery: JobRetry,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> JobRead:
+        """Reopen FAILED/DEAD_LETTERED once for the supplied current generation."""
+        try:
+            job = await retry_job(session, job_id, recovery.expected_generation)
+        except JobNotFound:
+            raise HTTPException(status_code=404, detail="Job not found") from None
+        except RetryConflict:
+            raise HTTPException(
+                status_code=409, detail="Job state or generation does not allow manual retry"
+            ) from None
+        return JobRead.model_validate(job)
 
     return app

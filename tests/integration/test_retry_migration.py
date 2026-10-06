@@ -30,7 +30,7 @@ def migration_config() -> Config:
 
 @pytest.fixture
 def retry_engine(integration_database_url: str) -> Iterator[Engine]:
-    command.upgrade(migration_config(), "head")
+    command.upgrade(migration_config(), "0006")
     engine = create_engine(integration_database_url, poolclass=NullPool)
     try:
         yield engine
@@ -183,7 +183,8 @@ async def test_migrated_running_owner_can_finish_or_recover_without_fabricated_h
                 "INSERT INTO dispatch_outbox (id, job_id, status, published_at) "
                 "VALUES (:id, :job_id, 'PUBLISHED', clock_timestamp())"
             ), {"id": uuid4(), "job_id": job_id})
-        command.upgrade(config, "0006")
+        # Current runtime includes generation fields introduced after the backfill.
+        command.upgrade(config, "head")
     finally:
         engine.dispose()
 

@@ -230,7 +230,9 @@ async def test_retryable_failures_exhaust_exact_budget_and_public_history_is_ord
             assert not await worker.run_once(retry_database, settings_for(retry_database))
             await mark_due(retry_database, job_id)
         else:
-            assert job.status is JobStatus.FAILED
+            assert job.status is JobStatus.DEAD_LETTERED
+            assert job.dead_letter_reason == "attempts_exhausted"
+            assert job.dead_lettered_at == job.finished_at
             assert job.finished_at is not None
             assert job.next_attempt_at is None
             assert job.error_info == FAILURE
@@ -270,6 +272,7 @@ async def test_permanent_task_errors_finish_after_one_attempt_despite_remaining_
     assert await worker.run_once(retry_database, settings_for(retry_database))
     failed = await read_job(retry_database, job_id)
     assert failed.status is JobStatus.FAILED
+    assert failed.dead_lettered_at is None and failed.dead_letter_reason is None
     assert failed.attempt_count == 1
     assert failed.error_info == {"code": code, "retryable": False}
     assert failed.next_attempt_at is None

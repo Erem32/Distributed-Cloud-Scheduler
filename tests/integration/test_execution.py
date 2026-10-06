@@ -154,7 +154,9 @@ async def test_failure_at_attempt_budget_is_terminal_without_reexecution(
     error = {"code": "controlled_failure", "retryable": True}
     assert await complete_claim(execution_database, claim, error=error)
     failed = await read_job(execution_database, job_id)
-    assert failed.status is JobStatus.FAILED
+    assert failed.status is JobStatus.DEAD_LETTERED
+    assert failed.dead_letter_reason == "attempts_exhausted"
+    assert failed.dead_lettered_at == failed.finished_at
     assert failed.error_info == error
     assert failed.result_metadata is None
     assert failed.attempt_count == 1

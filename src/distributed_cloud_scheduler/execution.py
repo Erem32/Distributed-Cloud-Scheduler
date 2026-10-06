@@ -27,6 +27,7 @@ class Claim:
     payload: dict[str, JsonValue]
     attempt_count: int
     token: UUID
+    generation: int = 0
 
 
 async def claim_pending(database: Database, lease_seconds: int) -> Claim | None:
@@ -77,6 +78,7 @@ async def _claim_available(
         session.add(
             JobAttempt(
                 job_id=job.id,
+                generation=job.generation,
                 attempt_number=job.attempt_count,
                 claim_token=token,
                 started_at=now,
@@ -84,7 +86,7 @@ async def _claim_available(
         )
         await session.flush()
         await session.refresh(job)
-        claim = Claim(job.id, job.type, job.payload, job.attempt_count, token)
+        claim = Claim(job.id, job.type, job.payload, job.attempt_count, token, job.generation)
     return claim
 
 
@@ -109,6 +111,7 @@ async def complete_claim(
             select(Job)
             .where(
                 Job.id == claim.id,
+                Job.generation == claim.generation,
                 Job.status == JobStatus.RUNNING,
                 Job.claim_token == claim.token,
                 Job.attempt_count == claim.attempt_count,
@@ -135,7 +138,7 @@ async def complete_claim(
 
 async def _current_attempt(session: AsyncSession, job: Job) -> JobAttempt:
     """A job's locked owner must match its atomically inserted history record."""
-    attempt = await session.get(JobAttempt, (job.id, job.attempt_count))
+    attempt = await session.get(JobAttempt, (job.id, job.generation, job.attempt_count))
     if (
         attempt is None
         or attempt.claim_token != job.claim_token
@@ -162,14 +165,21 @@ def _finish_attempt(
         and job.attempt_count < job.max_attempts
     ):
         retry_at = now + timedelta(seconds=retry_policy.delay_seconds(job.attempt_count))
-        session.add(DispatchOutbox(job_id=job.id, available_at=retry_at))
+        session.add(
+            DispatchOutbox(job_id=job.id, generation=job.generation, available_at=retry_at)
+        )
     job.status = (
         JobStatus.RETRY_WAIT
         if retry_at is not None
         else JobStatus.SUCCEEDED
         if result is not None
+        else JobStatus.DEAD_LETTERED
+        if error is not None and error.get("retryable") is True
         else JobStatus.FAILED
     )
+    dead_lettered = job.status is JobStatus.DEAD_LETTERED
+    job.dead_lettered_at = now if dead_lettered else None
+    job.dead_letter_reason = "attempts_exhausted" if dead_lettered else None
     job.finished_at = now
     job.next_attempt_at = retry_at
     job.claim_token = None

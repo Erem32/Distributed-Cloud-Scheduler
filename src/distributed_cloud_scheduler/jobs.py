@@ -56,6 +56,13 @@ class Job(Base):
         ),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_object"),
         CheckConstraint("max_attempts BETWEEN 1 AND 20", name="max_attempts_range"),
+        CheckConstraint("generation >= 0", name="generation_nonnegative"),
+        CheckConstraint(
+            "(dead_lettered_at IS NULL AND dead_letter_reason IS NULL) OR "
+            "(status = 'DEAD_LETTERED' AND dead_lettered_at IS NOT NULL "
+            "AND dead_letter_reason IS NOT NULL AND dead_letter_reason = 'attempts_exhausted')",
+            name="dead_letter_context",
+        ),
         CheckConstraint(
             "attempt_count >= 0 AND attempt_count <= max_attempts", name="attempt_count_range"
         ),
@@ -130,6 +137,11 @@ class Job(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dead_letter_reason: Mapped[str | None] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
@@ -210,12 +222,17 @@ class JobRead(BaseModel):
     started_at: AwareDatetime | None
     finished_at: AwareDatetime | None
     next_attempt_at: AwareDatetime | None = None
+    dead_lettered_at: AwareDatetime | None = None
+    dead_letter_reason: str | None = None
+    generation: int = 0
     attempt_count: int
     max_attempts: int
     result_metadata: dict[str, JsonValue] | None = None
     error_info: dict[str, JsonValue] | None = None
 
-    @field_validator("created_at", "started_at", "finished_at", "next_attempt_at")
+    @field_validator(
+        "created_at", "started_at", "finished_at", "next_attempt_at", "dead_lettered_at"
+    )
     @classmethod
     def normalize_timestamps(cls, value: datetime | None) -> datetime | None:
         """Keep responses in UTC even if a database session uses another time zone."""

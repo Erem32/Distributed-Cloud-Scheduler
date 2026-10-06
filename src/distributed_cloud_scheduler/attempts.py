@@ -26,6 +26,7 @@ class JobAttempt(Base):
 
     __tablename__ = "job_attempts"
     __table_args__ = (
+        CheckConstraint("generation >= 0", name="generation_nonnegative"),
         CheckConstraint("attempt_number BETWEEN 1 AND 20", name="attempt_number_range"),
         CheckConstraint(
             "finished_at IS NULL OR finished_at >= started_at", name="finished_after_start"
@@ -54,6 +55,9 @@ class JobAttempt(Base):
 
     job_id: Mapped[UUID] = mapped_column(
         ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    generation: Mapped[int] = mapped_column(
+        Integer, primary_key=True, default=0, server_default=text("0")
     )
     attempt_number: Mapped[int] = mapped_column(Integer, primary_key=True)
     claim_token: Mapped[UUID] = mapped_column(nullable=False)
@@ -85,6 +89,7 @@ class AttemptRead(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    generation: int = 0
     attempt_number: int
     status: AttemptStatus
     started_at: AwareDatetime
@@ -100,12 +105,21 @@ class AttemptRead(BaseModel):
         return value.astimezone(UTC) if value is not None else None
 
 
-async def list_attempts(session: AsyncSession, job_id: UUID) -> list[JobAttempt]:
-    """Read at most the twenty budgeted attempts, ordered by admission number."""
+async def list_attempts(
+    session: AsyncSession,
+    job_id: UUID,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    generation: int | None = None,
+) -> list[JobAttempt]:
+    """Read a bounded chronological page, optionally restricted to one generation."""
+    statement = select(JobAttempt).where(JobAttempt.job_id == job_id)
+    if generation is not None:
+        statement = statement.where(JobAttempt.generation == generation)
     attempts = await session.scalars(
-        select(JobAttempt)
-        .where(JobAttempt.job_id == job_id)
-        .order_by(JobAttempt.attempt_number)
-        .limit(20)
+        statement.order_by(JobAttempt.generation, JobAttempt.attempt_number)
+        .limit(limit)
+        .offset(offset)
     )
     return list(attempts)
