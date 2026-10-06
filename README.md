@@ -4,8 +4,9 @@ A portfolio backend project focused on explainable distributed job execution,
 PostgreSQL transactions, delivery semantics and failure recovery. Development is
 local-first and follows validated milestones. The local foundation contains a
 FastAPI API, persisted jobs, atomic local execution, durable dispatch obligations,
-PostgreSQL connectivity, explicit Alembic migrations and container setup. Cloud
-deployment and automatic retries are planned work; see the
+PostgreSQL connectivity, explicit Alembic migrations, container setup and a
+Pub/Sub publisher/push worker validated with the local emulator. Cloud deployment
+and automatic execution retries are planned work; see the
 [living plan](docs/PLAN.md).
 
 ## Current architecture
@@ -16,9 +17,9 @@ flowchart LR
     API -->|Commit job and outbox together| DB[(PostgreSQL)]
     Worker[Local polling worker] -->|Claim and persist outcomes| DB
     Worker --> Tasks[Deterministic handlers]
-    Dispatcher[Dispatcher adapter] -->|Lease and finalize outbox| DB
-    Dispatcher -.->|Publish job ID in tests| Queue[In-process test queue]
-    Queue -.-> Delivery[ID-delivery test worker]
+    Dispatcher[Pub/Sub dispatcher CLI] -->|Lease and finalize outbox| DB
+    Dispatcher -->|Publish job ID| Queue[Pub/Sub or local emulator]
+    Queue --> Delivery[Dedicated HTTP push worker]
     Delivery -->|Claim by ID and persist outcome| DB
     Delivery --> Tasks
     Migrations[Explicit Alembic command] --> DB
@@ -30,8 +31,9 @@ database; readiness executes `SELECT 1`. Migrations are an explicit command,
 separate from starting API replicas. The baseline establishes a migration chain
 without adding placeholder domain tables; revisions 0002 and 0003 add jobs and
 execution ownership/outcomes. Revision 0004 adds the transactional dispatch outbox
-and backfills existing PENDING, QUEUED and RUNNING jobs. The dashed queue path is
-exercised in tests; the supported local worker runtime still polls PostgreSQL.
+and backfills existing PENDING, QUEUED and RUNNING jobs. Direct database polling
+and Pub/Sub push both use the same execution ownership rules. The push worker
+runs separately from the submission API so Cloud Run service IAM can protect it.
 
 The target cloud stack is GCP Pub/Sub, Cloud Run and Cloud SQL, added after local
 execution and concurrency have been proved. See the
@@ -167,6 +169,12 @@ driver cancellation/connection cleanup can add latency during network failures.
 | `DISPATCH_LEASE_SECONDS` | Integer 1 through 300, greater than publish timeout plus 5; default 30 |
 | `DISPATCH_RETRY_BASE_SECONDS` | Finite value greater than 0 and at most 30; default 1 |
 | `DISPATCH_RETRY_MAX_SECONDS` | Finite value greater than 0 and at most 300, at least the retry base; default 60 |
+| `DISPATCH_POLL_INTERVAL_SECONDS` | Finite value greater than 0 and at most 10; default 0.5 |
+| `DISPATCH_SHUTDOWN_TIMEOUT_SECONDS` | Finite value greater than 0 and at most 60; default 20 |
+| `PUBSUB_TOPIC` | Full `projects/.../topics/...` name; required only by the dispatcher |
+| `PUBSUB_SUBSCRIPTION` | Full `projects/.../subscriptions/...` name; required only by the push worker |
+| `PUBSUB_EMULATOR_HOST` | Optional `host:port` for local insecure emulator RPC; omit for GCP ADC/TLS |
+| `PUSH_REQUEST_TIMEOUT_SECONDS` | Total push request work budget, finite greater than 0 and at most 60; default 45; must exceed task timeout by 5 |
 
 `COMPOSE_DATABASE_URL`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`,
 `POSTGRES_PORT` and `API_PORT` configure local Compose. PostgreSQL and API ports
@@ -221,12 +229,109 @@ Outbox rows for jobs already completed locally are explicitly SKIPPED.
 
 `LocalQueue` is a bounded, in-process test adapter with backpressure. Its messages
 do not survive process exit, and it is not a broker shared by CLI processes.
-There is no dispatcher CLI or Pub/Sub adapter yet. The complete adapter flow is
-demonstrated in [delivery tests](tests/integration/test_delivery.py); publication
-failure and replay are covered in [dispatcher tests](tests/integration/test_dispatcher.py).
+The Pub/Sub dispatcher runs serially, leasing one obligation per publication:
+
+```text
+python -m distributed_cloud_scheduler.dispatcher --once
+python -m distributed_cloud_scheduler.dispatcher
+```
+
+Set `PUBSUB_TOPIC` first. `--once` attempts at most one due obligation, and a failed
+publish remains READY with backoff. An exit code of zero does not mean publication
+succeeded; inspect the outbox for accepted versus deferred publication. Continuous
+mode polls and retries database connectivity failures. Signals stop new admission,
+drain the current publication, then cancel after the dispatch shutdown budget.
+The async Google SDK publishes exactly one canonical UUID as ASCII bytes with a
+bounded RPC and no implicit SDK retry; the outbox owns durable publication retries.
+Cancellation/timeout can leave ambiguous broker acceptance and later replay.
+
 The durable outbox relies on a dispatcher being invoked; it cannot publish by
-itself. Publication retries do not re-execute FAILED jobs. Broker integration,
-execution retries, and outbox retention policy follow later milestones.
+itself. Publication retries do not re-execute FAILED jobs. Local delivery and
+publication failure/replay remain covered in [delivery tests](tests/integration/test_delivery.py)
+and [dispatcher tests](tests/integration/test_dispatcher.py). Execution retry and
+outbox retention policy follow later milestones.
+
+## Pub/Sub push worker
+
+Run the dedicated worker after setting `PUBSUB_SUBSCRIPTION`:
+
+```text
+python -m distributed_cloud_scheduler.push --host 127.0.0.1 --port 8001
+```
+
+Its OpenAPI, liveness and database readiness endpoints are `/docs`, `/health` and
+`/ready`. The submission API has no push endpoint. `POST /pubsub/push` accepts the
+default wrapped Pub/Sub JSON envelope: matching `subscription`, nonempty
+`message.messageId` (or `message_id`), and `message.data` containing strict base64 of a canonical
+36-byte UUID. The whole body is limited to 8 KiB. Transport metadata is accepted;
+it cannot supply task data or execution attempts. Unwrapped delivery is unsupported.
+
+| Delivery condition | HTTP result |
+| --- | --- |
+| Committed success or classified failure; terminal duplicate | 204 ACK |
+| Expired target owner recovered to FAILED/worker_lost | 204 ACK |
+| Active ownership, row contention, full capacity or rejected completion | 503, redeliver |
+| Database failure or total request timeout | 503, redeliver |
+| Unknown job ID | 404, redeliver |
+| Invalid envelope/subscription/data; oversized body | 400 / 413, redeliver |
+
+Pub/Sub retries all these non-success responses. Unknown or malformed messages
+may therefore repeat indefinitely before a future dead-letter policy is configured.
+A FAILED job is currently terminal even if its error is classified retryable;
+broker delivery count does not consume or control execution attempts.
+
+The worker reserves at most `WORKER_CONCURRENCY` request slots per process and
+executes within the HTTP request. It uses the same handler deadline, database
+lease and fenced completion as polling. A RUNNING duplicate is not acknowledged
+while another owner may still fail. A redelivery recovers only its target's expired
+ownership. No background execution is required after a response.
+
+The default task/request deadlines are 15/45 seconds. Future deployment must set
+both the push subscription acknowledgement deadline and Cloud Run request timeout
+to at least 60 seconds, allowing time for cancellation cleanup. Driver cleanup can
+add latency. Size replica concurrency and database connection pools together.
+
+Local HTTP has no sender authentication. Subscription matching validates routing,
+not identity. Deploy this worker as a private Cloud Run service with Pub/Sub OIDC
+and `roles/run.invoker`; Cloud Run validates the token and audience. Service IAM,
+cloud delivery and infrastructure have not been validated here. See
+[D010](docs/DECISIONS.md) and Google's [authenticated push documentation](https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions).
+
+## Local Pub/Sub emulator verification
+
+The optional Compose file adds Google's Pub/Sub emulator, bound to loopback port
+8681. It needs no GCP account or host gcloud installation. With the dedicated
+`TEST_DATABASE_URL` configured as described below, run on Windows:
+
+```powershell
+docker compose -f compose.yaml -f compose.pubsub.yaml up -d --wait db pubsub
+$env:PUBSUB_EMULATOR_HOST = '127.0.0.1:8681'
+python scripts/pubsub_smoke.py --push-host host.docker.internal
+```
+
+The smoke creates a random schema, topic and push subscription, starts a live
+worker on a free port, and exercises the real dispatcher CLI/Google SDK. It verifies
+persisted results, success/failure duplicate ACKs, malformed/unknown/oversized
+requests, and durable publication recovery after a broker connection failure.
+It removes its resources and fails when prerequisites or checks fail.
+`--push-host` must be reachable from the emulator; Docker Desktop uses
+`host.docker.internal` to reach the host worker. The default `127.0.0.1` suits
+an emulator running directly on the same host.
+
+The same smoke also runs inside the Linux runtime image. Build the image, then
+use the example below with credentials matching your local database:
+
+```text
+docker compose build api
+docker compose -f compose.yaml -f compose.pubsub.yaml run --rm --no-deps --name pubsub-smoke-runner -e TEST_DATABASE_URL=postgresql+psycopg://scheduler:example_local_password@db:5432/scheduler_test -e PUBSUB_EMULATOR_HOST=pubsub:8085 -v ./scripts:/app/scripts:ro api python scripts/pubsub_smoke.py --push-host pubsub-smoke-runner
+```
+
+The container's `TEST_DATABASE_URL` uses `db:5432`, while host tests use
+`127.0.0.1:5433`. These are dummy example credentials. The script refuses the
+application database and requires a separate name ending in `_test`.
+To stop just the optional broker, use
+`docker compose -f compose.yaml -f compose.pubsub.yaml stop pubsub`.
+Emulator data is temporary and it does not validate IAM or production delivery guarantees.
 
 ## Verification
 
@@ -251,7 +356,8 @@ cleanup and job validation. Database tests cover real async connections/readines
 job API persistence/ordering, database constraints, competing claims, stale-token
 and lock-wait expiry races, cancellation, concurrency limits, graceful draining,
 independent process claims/crashes and handler isolation, atomic job/outbox commits,
-publication failure/backoff/replay, duplicate ID delivery, and an Alembic
+publication failure/backoff/replay, duplicate ID delivery, push envelope validation,
+HTTP ACKs, push capacity/deadlines/cancellation, targeted lease recovery, and an Alembic
 upgrade/downgrade/re-upgrade round trip with active-job backfill. Integration tests
 explicitly skip if no test URL is configured; skips do not validate the database
 milestone. `alembic check` checks ORM/schema drift against the migrated application

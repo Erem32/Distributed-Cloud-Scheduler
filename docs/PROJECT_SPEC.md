@@ -71,6 +71,14 @@ an interface only when local and cloud implementations need a shared contract.
 Keep the API, worker, and eventual scheduler in one project; separate runtime
 entry points do not imply independent microservice codebases.
 
+The push worker is a separate HTTP application from the submission API. Its
+`POST /pubsub/push` service interface receives wrapped Pub/Sub envelopes containing
+only a base64-encoded canonical job UUID. It acknowledges durable terminal outcomes,
+and requests redelivery while execution or dependency recovery remains outstanding.
+D010 defines bounded request execution and the initial acknowledgement policy;
+execution retry policy is separate. Production access requires private Cloud Run
+service IAM and authenticated Pub/Sub push. Local emulator delivery cannot validate IAM.
+
 ## Major components
 
 - **API:** validate submissions, expose job status/listing and manual retry, and

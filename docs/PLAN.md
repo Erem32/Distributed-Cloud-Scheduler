@@ -1,12 +1,11 @@
 # Project status
 
-- **Current milestone:** 5 - queue boundary and durable dispatch (COMPLETE).
-- **Current state:** Milestones 0-5 are validated. The API commits jobs and dispatch
-  obligations atomically; bounded local workers claim, execute and persist outcomes.
-  Publisher failure/replay, duplicate delivery, process crashes and shutdown are tested.
-- **Next objective:** Milestone 6 - Google Pub/Sub integration (NOT STARTED).
-- **Session boundary:** Work stops after milestone 5 at the user's request. Resume
-  only with user authorization in a later session.
+- **Current milestone:** 6 - Google Pub/Sub integration (COMPLETE).
+- **Current state:** Milestones 0-6 are validated locally. The Pub/Sub dispatcher
+  publishes durable obligations; a separate bounded HTTP worker commits outcomes
+  before ACK. Windows/Linux SDK-emulator delivery and failure recovery pass.
+- **Next objective:** Milestone 7 - submission idempotency and duplicate delivery (NOT STARTED).
+- **Session boundary:** Milestone 6 is tied off; ask before starting milestone 7.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -19,15 +18,17 @@ not; update this document instead of advertising unfinished behavior.
 
 # Architecture snapshot
 
-The supported runtime is FastAPI, PostgreSQL 17 and optional bounded local polling
-workers. API resources belong to lifespan; async SQLAlchemy sessions are
+The supported runtime is FastAPI, PostgreSQL 17, optional bounded local polling
+workers, a Pub/Sub dispatcher CLI and a separate HTTP push worker. API/worker
+resources belong to lifespan; async SQLAlchemy sessions are
 operation-scoped. Explicit Alembic commands manage the schema; revision 0004 adds
 the transactional dispatch outbox and backfills existing active jobs. The API runs
 on Windows or in a non-root Python 3.12 container. GCP has no role in local startup.
 
 The publisher boundary and ID-specific execution path are exercised by real
-PostgreSQL tests and live same-process delivery smoke tests. `LocalQueue` is an
-in-process test adapter; it is not a durable broker or a shared CLI service.
+PostgreSQL tests and live Google SDK/emulator HTTP delivery smokes on Windows and
+Linux. Pub/Sub settings and SDK imports stay in transport/runtime modules.
+`LocalQueue` remains an in-process test adapter, not a shared CLI broker.
 
 ```mermaid
 flowchart LR
@@ -35,9 +36,9 @@ flowchart LR
     API -->|Commit job and outbox together| DB[(PostgreSQL 17)]
     Worker[Bounded concurrent local workers] -->|Claim and persist outcome| DB
     Worker --> Handlers[Bounded deterministic handlers]
-    Dispatcher[Dispatcher adapter] -->|Lease and finalize outbox| DB
-    Dispatcher -.->|Publish job ID in tests| Queue[In-process test queue]
-    Queue -.-> Delivery[ID-delivery test worker]
+    Dispatcher[Pub/Sub dispatcher CLI] -->|Lease and finalize outbox| DB
+    Dispatcher -->|Publish job ID| Queue[Pub/Sub or local emulator]
+    Queue --> Delivery[Dedicated HTTP push worker]
     Delivery -->|Claim by ID and persist outcome| DB
     Delivery --> Handlers
     Migrations[Explicit Alembic command] --> DB
@@ -135,16 +136,26 @@ flowchart LR
 
 ## 6 - Google Pub/Sub integration
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE (local SDK/emulator integration; cloud deployment deferred).
 - **Objective:** Deliver persisted job IDs through a Cloud Run-compatible push endpoint.
 - **Tasks:** Add publisher and validated push envelope adapter, HTTP acknowledgement
   behavior, local/emulator tests where supported, and a bounded task execution policy.
 - **Design questions:** Push authentication, duplicate/out-of-order delivery, message
   size, request deadlines, malformed messages and transport outages.
-- **Acceptance:** A delivered ID loads authoritative DB state, claims, executes and
-  persists an outcome; acknowledgement behavior is explicit; no domain GCP imports.
-- **Validation:** Publisher/envelope tests, duplicate delivery, unavailable broker/DB
-  scenarios, and a controlled cloud smoke when an authorized environment exists.
+- **Acceptance:** The real Python Pub/Sub SDK publishes canonical UUID bytes through
+  the existing outbox. A wrapped push ID loads authoritative DB state, claims,
+  executes and persists an outcome before HTTP 204. Terminal duplicates return 204;
+  live/contended ownership, full capacity, request timeout and dependency failures
+  return 503. Unknown IDs return 404; malformed/oversized envelopes return 400/413.
+  Non-success responses request broker redelivery. Targeted expired ownership becomes
+  FAILED/worker_lost before acknowledgement, without re-execution or unrelated recovery.
+  No domain GCP imports or new database schema. The public API remains a separate runtime.
+- **Validation:** Standard checks with no database skips; publisher/envelope/config
+  tests; real PostgreSQL push success/failure, concurrent duplicates, ownership expiry,
+  claim/completion failures, lock contention, bounded admission and cancellation tests;
+  migration round trip and schema drift; real SDK -> emulator -> live HTTP worker ->
+  PostgreSQL smoke on Windows and Linux, including replay and broker outage recovery.
+  Cloud smoke is conditional on an authorized cloud environment, absent in this session.
 
 ## 7 - Submission idempotency and duplicate delivery
 
@@ -306,47 +317,57 @@ flowchart LR
 
 # Current milestone details
 
-Milestone 5 persists a dispatch outbox row in the same transaction as each new
-job. A dispatcher leases due rows, calls a small async publisher outside the
-transaction, then fences completion; a crash after publish can cause duplicate
-publication, not silent loss. Publication failures remain durable and retry with
-bounded exponential backoff and sanitized error codes. Successful publication
-marks PUBLISHED and changes only a still-PENDING job to QUEUED. Local execution
-can instead finish first, in which case an unneeded obligation is SKIPPED. A
-bounded local/test queue carries only job IDs. Both ID-specific claiming and direct
-polling admit PENDING/QUEUED jobs through the same token/lease rules. Direct polling
-remains the supported local runtime; no cloud transport or dispatcher CLI is needed.
+Milestone 6 keeps the existing outbox and execution rules. `pubsub_config.py`
+isolates optional transport settings; `pubsub.py` provides the async Google
+publisher with explicit RPC timeout/no hidden SDK retries; `dispatcher.py` adds
+a signal-aware CLI; `push.py` provides a dedicated worker app/CLI. The wire
+payload is exactly the 36 ASCII bytes of
+a canonical UUID; only the database supplies task type/payload. Wrapped envelopes
+must match the configured subscription and include messageId and strict base64 data.
+Allow transport metadata, but cap the entire HTTP body at 8 KiB.
 
-Implementation: `messaging.py` provides the publisher protocol and `LocalQueue`;
-`outbox.py` owns leased obligations; `dispatcher.py` performs one publication
-attempt; `execution.claim_job` selects a delivered ID. No new dependencies or
-cloud imports were introduced. Publication retry and execution retry are separate:
-FAILED jobs still await the future retry policy.
+The worker reserves a process-local execution slot without waiting and applies a total request
+budget (default 45 seconds) greater than task timeout plus five seconds, reuse
+the worker task deadline/lease, and release admission even after cancellation.
+Inspect/recover only the delivered expired owner. A lost/fenced completion must
+not produce a success acknowledgement. Persisted FAILED is terminal even when
+its error is retryable; execution retry authority remains milestone 8.
+
+Authentication belongs to a separate private Cloud Run worker service whose IAM
+validates Pub/Sub OIDC. Local HTTP/emulator tests have no authentication. Expected
+subscription validation is routing validation, not proof of sender identity.
+Future deployment must use a subscription acknowledgement deadline and Cloud Run
+request timeout of at least 60 seconds with the default budgets, and configure
+graceful shutdown/replica connection budgets. No cloud resources are provisioned here.
+
+`google-cloud-pubsub>=2.42,<3` is the added transport dependency. Optional
+`compose.pubsub.yaml` starts the local emulator; `scripts/pubsub_smoke.py` fails
+on missing prerequisites and cleans its randomized broker resources/database schema.
+The environment has
+no gcloud executable, ADC file or credential environment configuration; cloud
+IAM/delivery validation remains conditional and must not be inferred from emulator tests.
 
 Validation completed on 2026-10-06:
 
-- `python scripts/check.py`: Ruff passed, strict mypy passed for 12 source files,
-  **257 pytest tests passed with no skips** on Windows/Python 3.13.1 and PostgreSQL 17.
-- Database coverage includes atomic job/outbox rollback, failure and capped backoff,
-  cancellation/restart, acceptance-before-marker crash replay, concurrent dispatchers,
-  duplicate ID claims, terminal skipping, unchanged execution state and stale tokens.
-  Both execution and publication recheck leases after actual PostgreSQL lock waits.
-- Isolated migration tests upgrade/downgrade/re-upgrade and seed all six job states
-  at 0003. Revision 0004 backfills only active jobs and preserves every job field
-  and existing RUNNING ownership through upgrade/downgrade/re-upgrade.
-- The rebuilt Compose image migrated the application to 0004. `alembic check`
-  found no ORM/schema drift. Live health, readiness, Swagger and OpenAPI returned 200.
-- Container API submission -> durable outbox -> local queue -> ID-specific claim ->
-  persisted success passed using the Windows host and inside the Linux Python
-  **3.12.15** container (UID **10001**). Calculation results were 10 and 15;
-  each job recorded one attempt and ignored a subsequent duplicate delivery.
-
-Earlier milestone evidence remains relevant: a live database outage yielded
-readiness 503 with liveness 200 and recovered after restart; host/container polling
-workers executed real API jobs. Current tests retain concurrency 1/3/20,
-independent CLI contention and forced-process-crash recovery. A Linux SIGTERM
-smoke drained two active jobs, left another PENDING and exited 0. These are local
-correctness checks, not cloud deployment or throughput measurements.
+- Project venv `python scripts/check.py`: Ruff passed; strict mypy passed for
+  15 source files; **392 tests passed without skips** on Windows/Python 3.13.1
+  with PostgreSQL 17. The resumed baseline also passed its original 257 tests.
+- New tests cover strict envelopes/body limits, metadata isolation, real DB refusal,
+  explicit HTTP ACK/NACKs, live duplicates, PostgreSQL row-lock contention, targeted
+  expired-owner recovery, stale completion, DB failure during finalization, request
+  deadlines/intake cancellation, bounded admission and dispatcher drain/cancellation.
+- Existing migration upgrade/downgrade/re-upgrade and active outbox backfill tests
+  pass. Host upgrade/head and host/container `alembic check` pass with no drift;
+  no schema revision was added.
+- Windows host and rebuilt Linux Python 3.12.15 image (UID 10001) both pass real
+  dispatcher CLI -> Google SDK 2.42.0 -> emulator -> live HTTP push -> PostgreSQL.
+  Calculation 42, durable controlled failure, broker duplicates/HTTP 204s and
+  malformed/unknown/oversized HTTP 400/404/413 are verified. Broker connection
+  failure leaves READY without an execution attempt; recovery marks PUBLISHED on
+  publication attempt 2 and succeeds on execution attempt 1.
+- Live worker health/readiness/OpenAPI and separate HTTP interface pass. Smokes
+  remove their isolated schemas/topics/subscriptions and child processes.
+  No cloud resources, IAM or production delivery guarantees were validated.
 
 The roadmap is intentionally sequential. Basic atomic claiming is required before
 concurrency, and durable publication/reconciliation is required before Pub/Sub.
@@ -364,15 +385,16 @@ them and does not postpone correctness testing.
 - D006: persistence-only job API, strict JSONB inputs and bounded offset pagination.
 - D007/D008: database token/lease ownership, bounded loops and graceful draining.
 - D009: transactional dispatch outbox, replayable publication and separate attempt budgets.
+- D010: separate Pub/Sub runtimes, bounded push requests and ACK after durable terminal state.
 
 # Risks / technical debt
 
-- Local runtime and milestone 5 acceptance checks pass. Milestone 6 remains
-  deliberately unstarted at the user's session boundary.
+- Milestone 6's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
+  deployment-stage validation, not evidence supplied by the emulator.
 - No cloud environment or spending authorization has been established. Cloud rollout
   must not be claimed validated from local tests.
-- Cloud push validation/acknowledgements, execution retry authority, dead-letter
-  mapping, dispatcher/scheduler hosting and priority semantics need later decisions.
+- Cloud IAM, execution retry authority, dead-letter mapping, dispatcher/scheduler
+  hosting and priority semantics still need deployment/reliability decisions.
 - `LocalQueue` loses buffered messages on process exit. The outbox is durable, but
   marking acceptance requires a transport whose acceptance guarantees fit deployment.
   A dispatcher must be invoked to publish/replay obligations; local tests do not
@@ -386,8 +408,8 @@ them and does not postpone correctness testing.
 
 # Next actions
 
-1. Stop for today with milestones 0-5 complete and documentation current.
-2. When the user resumes, review milestone 6 before adding its Pub/Sub publisher
-   and validated push envelope/acknowledgement behavior.
-3. Preserve the outbox and shared claim rules; verify malformed/duplicate delivery
-   and dependency failures locally before claiming any cloud integration.
+1. Ask for authorization to begin milestone 7; do not start it before the user agrees.
+2. If authorized, define submission key/fingerprint scope and concurrent replay/conflict
+   acceptance criteria before implementing API idempotency.
+3. Preserve shared execution ownership and milestone 6's acknowledgement regressions;
+   leave automatic execution retry and cloud provisioning to their planned milestones.

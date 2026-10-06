@@ -137,10 +137,10 @@ The following choices govern this architecture:
 - **Scheduling and priority:** due-job claiming, multiple schedulers, restart
   behavior, practical ordering limits, and a suitable scheduler deployment model.
 
-Retry ownership, dead-letter behavior, scheduling/priority, and cloud HTTP
-acknowledgement policy remain open. Their milestones must add specific decisions
-and regression tests. The local outbox/ownership validation does not establish
-cloud delivery behavior.
+Retry ownership, dead-letter behavior and scheduling/priority remain open.
+D010 defines the initial HTTP acknowledgement policy without automatic execution
+retries. Later milestones must add specific decisions and regression tests.
+Local outbox/ownership validation does not establish cloud delivery behavior.
 
 ## D005 - Portable development checks and API startup
 
@@ -308,4 +308,66 @@ Publication retry uses capped exponential backoff with sanitized error codes;
 retry attempts do not consume the execution attempt budget. Revision 0004 backfills
 existing active jobs without altering their execution state. The adapter is invoked
 explicitly in tests; a production dispatcher runtime and outbox retention policy
-are deferred to the transport/deployment and operations stages.
+were deferred to the transport/deployment and operations stages. D010 adds the
+Pub/Sub dispatcher runtime; its cloud hosting and outbox retention remain deferred.
+
+## D010 - Pub/Sub adapters and acknowledgement after durable outcomes
+
+**Date:** 2026-10-06
+
+**Status:** Accepted for milestone 6; cloud IAM and deployment validation deferred
+
+**Decision:** Publish only canonical UUID ASCII bytes using the asynchronous
+Google Pub/Sub client behind the existing publisher protocol. Disable implicit
+SDK RPC retries and bound each RPC; the durable outbox owns publication retries.
+Use a separate HTTP push worker runtime and validate wrapped envelopes against
+the expected subscription, strict base64 data, a canonical UUID and an 8 KiB
+request body limit. Load task data and execution attempts from PostgreSQL.
+
+Execute within the request, using existing token/lease claims and fenced outcome
+commits. Admit at most WORKER_CONCURRENCY requests per process, returning 503
+immediately when full. Bound total request work separately from the handler
+deadline. A targeted expired owner is durably FAILED/worker_lost before ACK;
+other jobs are untouched. Current FAILED outcomes remain terminal even when
+their classification is retryable; milestone 8 owns execution retry policy.
+
+HTTP 204 acknowledges a persisted terminal outcome, including duplicate delivery
+and handler failure. Active/contended ownership, rejected completion, exhausted
+capacity, request timeout and dependency failures return 503. Unknown IDs return
+404, malformed envelopes 400 and oversized bodies 413. These responses request
+redelivery; malformed/unknown messages can repeat indefinitely until operational
+dead-letter policy is configured. They are not silently treated as successful jobs.
+
+**Context:** Pub/Sub push acknowledges only 102, 200, 201, 202 or 204. Its
+subscription acknowledgement deadline also bounds the HTTP request, and individual
+push deadlines cannot be extended. ACKing a RUNNING duplicate before the owner
+commits could remove the redelivery needed to observe a crashed owner's lease.
+See [push behavior](https://docs.cloud.google.com/pubsub/docs/push) and
+[subscription deadlines](https://docs.cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions).
+
+**Alternatives:** ACK immediately and rely on background work; ACK every unclaimed
+ID; treat broker delivery attempts as application attempts; put the endpoint in
+the public submission API; add custom JWT verification before deployment design;
+use the high-level threaded batching publisher for single leased obligations.
+
+**Reasoning:** Awaiting execution keeps Cloud Run work within an active request,
+and PostgreSQL remains authoritative. Separate runtimes allow service IAM to
+protect the worker without making the submission API private. An async unary
+publisher avoids a thread/batch lifecycle and makes bounded transport failures
+visible to the outbox. A cancelled RPC can still have been accepted by the broker;
+ambiguous acceptance remains at least once and is safe only through shared claims.
+
+**Consequences:** Local emulator HTTP does not authenticate senders. Future
+deployment requires a private Cloud Run worker, Pub/Sub push OIDC identity with
+run.invoker, token-creation permissions, and the correct audience. Subscription
+matching is routing validation, not authentication. Cloud Run verifies the OIDC
+token through service IAM; see [authenticated push](https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions)
+and [Cloud Run Pub/Sub tutorial](https://docs.cloud.google.com/run/docs/tutorials/pubsub).
+Default task/request budgets are 15/45 seconds; provision at least 60-second
+subscription and Cloud Run request deadlines to include cancellation cleanup.
+Database cancellation/connection cleanup can still extend latency. Replicas,
+connection budgets and dispatcher hosting must be designed at deployment.
+The [emulator](https://docs.cloud.google.com/pubsub/docs/emulator) validates SDK
+publication and push delivery locally, but lacks IAM and production guarantees.
+No database migration, automatic execution retry, submission idempotency or cloud
+provisioning is introduced by this decision.

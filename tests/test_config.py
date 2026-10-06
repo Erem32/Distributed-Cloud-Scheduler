@@ -135,6 +135,12 @@ def test_worker_budget_can_be_configured() -> None:
         {"dispatch_retry_base_seconds": 0},
         {"dispatch_retry_max_seconds": float("nan")},
         {"dispatch_retry_base_seconds": 10, "dispatch_retry_max_seconds": 5},
+        {"dispatch_poll_interval_seconds": 0},
+        {"dispatch_poll_interval_seconds": float("nan")},
+        {"dispatch_poll_interval_seconds": 11},
+        {"dispatch_shutdown_timeout_seconds": 0},
+        {"dispatch_shutdown_timeout_seconds": float("inf")},
+        {"dispatch_shutdown_timeout_seconds": 61},
     ],
 )
 def test_dispatch_budgets_are_bounded_and_allow_completion_margin(

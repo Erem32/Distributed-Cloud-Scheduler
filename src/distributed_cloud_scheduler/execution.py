@@ -118,18 +118,22 @@ async def complete_claim(
     return completed_id is not None
 
 
-async def recover_expired(database: Database, limit: int = 100) -> int:
-    """Fail a bounded batch of expired owners; retries are an explicit later policy."""
+async def recover_expired(
+    database: Database, limit: int = 100, *, job_id: UUID | None = None
+) -> int:
+    """Fail a bounded batch or one delivered expired owner without execution retries."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be an integer between 1 and 1000")
     async with database.session_factory() as session, session.begin():
+        candidates = select(Job.id).where(
+            Job.status == JobStatus.RUNNING,
+            Job.lease_expires_at <= func.clock_timestamp(),
+        )
+        if job_id is not None:
+            candidates = candidates.where(Job.id == job_id)
         expired_ids = list(
             await session.scalars(
-                select(Job.id)
-                .where(
-                    Job.status == JobStatus.RUNNING,
-                    Job.lease_expires_at <= func.clock_timestamp(),
-                )
+                candidates
                 .order_by(Job.lease_expires_at, Job.id)
                 .limit(limit)
                 .with_for_update(skip_locked=True)
