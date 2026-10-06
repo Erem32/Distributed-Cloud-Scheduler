@@ -1,4 +1,4 @@
-"""Exercise live API identity, retries, manual recovery and emulator push.
+"""Exercise live API identity, retries, recovery, scheduling and emulator push.
 
 Set TEST_DATABASE_URL to a separate database ending in _test and explicitly set
 PUBSUB_EMULATOR_HOST. Start the optional compose.pubsub.yaml emulator first. When
@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -580,6 +580,169 @@ async def exercise_manual_recovery(
     )
 
 
+async def runtime_once(module: str, environment: dict[str, str]) -> None:
+    """Run a separate runtime process, retaining its database state after exit."""
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-m", f"distributed_cloud_scheduler.{module}", "--once"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        timeout=20,
+        check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    require(completed.returncode == 0, f"Live {module} --once exited unsuccessfully")
+
+
+async def exercise_scheduled_delivery(
+    database: Database,
+    publisher: PubSubPublisher,
+    settings: Settings,
+    api_url: str,
+    log_path: Path,
+    environment: dict[str, str],
+) -> None:
+    """Restart scheduler processes around due admission and durable publication."""
+    async with database.session_factory() as session:
+        database_now = await session.scalar(select(func.clock_timestamp()))
+    require(isinstance(database_now, datetime), "Database did not return its scheduling clock")
+    assert isinstance(database_now, datetime)
+    due = database_now + timedelta(seconds=12)
+    scheduled_key = f"smoke-scheduled:{uuid4().hex}"
+    submission = {
+        "type": "calculation",
+        "payload": {"numbers": [19, 23]},
+        "scheduled_at": due.isoformat(timespec="microseconds"),
+    }
+    status, created = await api_submission(api_url, submission, scheduled_key)
+    require(
+        status == 201
+        and created.get("status") == "SCHEDULED"
+        and created.get("attempt_count") == 0
+        and created.get("generation") == 0
+        and datetime.fromisoformat(created["scheduled_at"]) == due,
+        "Live API did not preserve a UTC scheduled submission as durable admission intent",
+    )
+    scheduled_id = UUID(created["id"])
+    offset_submission = {
+        **submission,
+        "scheduled_at": due.astimezone(timezone(timedelta(hours=2))).isoformat(
+            timespec="microseconds"
+        ),
+    }
+    status, replayed = await api_submission(api_url, offset_submission, scheduled_key)
+    require(
+        status == 200 and replayed == created,
+        "Equivalent scheduling instants with different offsets did not replay one identity",
+    )
+    status, conflict = await api_submission(
+        api_url,
+        {**submission, "scheduled_at": (due + timedelta(microseconds=1)).isoformat()},
+        scheduled_key,
+    )
+    require(
+        status == 409 and scheduled_key not in json.dumps(conflict),
+        "A different original schedule did not return a sanitized identity conflict",
+    )
+    async with database.session_factory() as session:
+        count = await session.scalar(
+            select(func.count()).select_from(Job).where(Job.idempotency_key == scheduled_key)
+        )
+    require(
+        count == 1
+        and not await read_outbox_rows(database, scheduled_id)
+        and not await public_attempts(api_url, scheduled_id),
+        "Scheduled submission/replay produced execution history or a premature outbox obligation",
+    )
+    require(await before_due(database, due), "Scheduled due time elapsed before the early probe")
+    acknowledgements = acknowledged_pushes(log_path)
+    await publisher.publish(scheduled_id)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    await runtime_once("scheduler", environment)
+    await runtime_once("worker", environment)
+    require(
+        await before_due(database, due)
+        and await public_job(api_url, scheduled_id) == created
+        and not await public_attempts(api_url, scheduled_id)
+        and not await read_outbox_rows(database, scheduled_id)
+        and not await dispatch_once(database, publisher, settings),
+        "Early SDK delivery, polling or scheduler admission bypassed the database due time",
+    )
+    print(
+        "PASS: future keyed schedule normalizes offsets; early SDK delivery ACKs without "
+        "attempts/outbox, and separate scheduler/polling processes respect the due gate",
+        flush=True,
+    )
+    async with asyncio.timeout(20):
+        while await before_due(database, due):
+            await asyncio.sleep(0.05)
+    # An ID does not substitute for scheduler admission, even after the original
+    # due time. The earlier scheduler exited before due; this durable row survives.
+    acknowledgements = acknowledged_pushes(log_path)
+    await publisher.publish(scheduled_id)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    require(
+        await public_job(api_url, scheduled_id) == created
+        and not await public_attempts(api_url, scheduled_id)
+        and not await read_outbox_rows(database, scheduled_id),
+        "A due but unadmitted scheduled ID bypassed authoritative admission",
+    )
+    await runtime_once("scheduler", environment)
+    admitted = await public_job(api_url, scheduled_id)
+    rows = await read_outbox_rows(database, scheduled_id)
+    require(
+        admitted.get("status") == "PENDING"
+        and admitted.get("attempt_count") == 0
+        and admitted.get("scheduled_at") == created.get("scheduled_at")
+        and len(rows) == 1
+        and rows[0].status is DispatchStatus.READY
+        and rows[0].generation == 0
+        and rows[0].publish_attempt_count == 0
+        and not await public_attempts(api_url, scheduled_id),
+        "Restarted scheduler did not atomically persist one immediate admission obligation",
+    )
+    # The admission process has exited before publication. A fresh scheduler must
+    # retain the committed outbox and avoid admitting the same scheduled row again.
+    await runtime_once("scheduler", environment)
+    require(
+        await public_job(api_url, scheduled_id) == admitted
+        and [row.id for row in await read_outbox_rows(database, scheduled_id)] == [rows[0].id],
+        "A scheduler restart after admission duplicated or lost durable publication intent",
+    )
+    acknowledgements = acknowledged_pushes(log_path)
+    await runtime_once("dispatcher", environment)
+    completed = await wait_for_outcome(database, scheduled_id, JobStatus.SUCCEEDED)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    history = await public_attempts(api_url, scheduled_id)
+    rows = await read_outbox_rows(database, scheduled_id)
+    require(
+        completed.attempt_count == 1
+        and completed.result_metadata == {"sum": 42}
+        and completed.scheduled_at == due
+        and completed.started_at is not None
+        and completed.started_at >= due
+        and len(history) == 1
+        and history[0].get("status") == "SUCCEEDED"
+        and history[0].get("generation") == 0
+        and len(rows) == 1
+        and rows[0].status is DispatchStatus.PUBLISHED
+        and rows[0].publish_attempt_count == 1,
+        "Scheduled dispatcher/SDK/push flow did not execute one due owned attempt",
+    )
+    terminal = await public_job(api_url, scheduled_id)
+    status, replayed = await api_submission(api_url, offset_submission, scheduled_key)
+    require(
+        status == 200 and replayed == terminal,
+        "Terminal scheduled identity did not retain its normalized original due date",
+    )
+    print(
+        "PASS: scheduler restart before due and after admission retains one obligation; "
+        "dispatcher CLI -> SDK/emulator/push executes once after due with original date/history",
+        flush=True,
+    )
+
+
 async def exercise(
     settings: Settings,
     cloud: PubSubSettings,
@@ -597,6 +760,7 @@ async def exercise(
             "max_attempts": 3,
             "payload": {"numbers": [8, 13, 21]},
             "type": "calculation",
+            "scheduled_at": None,
         }
         status, created = await api_submission(api_url, success_submission, success_key)
         require(status == 201 and created.get("status") == "PENDING", "Keyed API create failed")
@@ -762,6 +926,10 @@ async def exercise(
             "Recovered publication did not execute exactly one owned attempt",
         )
         print("PASS: broker outage stays READY; real SDK retry succeeds", flush=True)
+
+        await exercise_scheduled_delivery(
+            database, publisher, settings, api_url, log_path, environment
+        )
 
         # Leave these jobs pending so they cannot change the fault checks' dispatch ordering.
         nested_key = f"smoke-nested:{uuid4().hex}"

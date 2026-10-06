@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     dispatch_retry_max_seconds: float = Field(default=60, gt=0, le=300, allow_inf_nan=False)
     dispatch_poll_interval_seconds: float = Field(default=0.5, gt=0, le=10, allow_inf_nan=False)
     dispatch_shutdown_timeout_seconds: float = Field(default=20, gt=0, le=60, allow_inf_nan=False)
+    scheduler_batch_size: int = Field(default=100, ge=1, le=1000)
+    scheduler_poll_interval_seconds: float = Field(default=0.5, gt=0, le=10, allow_inf_nan=False)
+    scheduler_shutdown_timeout_seconds: float = Field(default=20, gt=0, le=60, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_lease_budget(self) -> Self:

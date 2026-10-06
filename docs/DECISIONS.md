@@ -574,3 +574,71 @@ has positive generation, preventing history loss or silent reversal of recovery.
 Stop runtimes for schema migration. Downgrade acquires exclusive table locks before
 checking generations; the check and schema removal share one transaction, closing
 the race with an in-flight manual recovery.
+
+## D014 - Durable scheduled admission and compatible submission identity
+
+**Date:** 2026-10-06
+
+**Status:** Accepted for milestone 10; validation evidence recorded in PLAN
+
+**Decision:** Add optional aware scheduled_at, normalized to UTC before persistence
+and fingerprinting. HTTP timestamps are RFC 3339 with explicit offset/Z, seconds
+and at most six fractional digits. Reject naive/date-only/numeric/invalid/leap-second/UTC-overflow
+input. Past dates are accepted. Every non-NULL date starts SCHEDULED; omitted/NULL
+dates retain immediate PENDING + outbox behavior. No recurrence or schedule edits.
+
+SCHEDULED is durable admission responsibility and initially has no outbox. A
+transport-independent scheduler samples the PostgreSQL clock and selects due
+SCHEDULED rows in scheduled_at/id order with a bounded batch and FOR UPDATE SKIP
+LOCKED. The same transaction changes them to PENDING and inserts one fresh
+current-generation outbox per job. Admission makes no network call and needs no
+persisted lease. Row locks and state transition prevent duplicate admission;
+rollback/cancellation retains intent, and a crash after commit retains dispatch.
+The due partial index bounds selection to unadmitted work. Skipped rows are
+revisited; no strict global admission or execution ordering is promised.
+
+Polling and ID claims never execute SCHEDULED. Initial-generation PENDING/QUEUED
+claims independently check the original due time against the database clock.
+Push ACKs SCHEDULED at any due time: successful admission supplies fresh outbox
+delivery; rollback leaves the durable row for a later scheduler pass. Due execution
+contention continues to NACK. Defensively skip any publication obligation observed
+while SCHEDULED; admission creates its own fresh one. Retry timing still belongs to
+next_attempt_at. Manual recovery preserves the original schedule/identity and opens
+an immediate new generation under D013, with no second initial wait.
+
+Fingerprint NULL/omitted dates by excluding scheduled_at entirely, retaining every
+existing D011 digest byte. Non-NULL dates contribute a normalized UTC ISO timestamp
+with six fractional digits. Equivalent offsets/spellings identify the same instant;
+different dates conflict under one key. Keep the original digest and timestamp
+through admission, automatic retry and manual recovery. Migration 0008 leaves all
+legacy dates NULL and preserves jobs, keys, history and obligations unchanged.
+Downgrade locks all three tables before checking and refuses when any original
+schedule remains, including completed work, protecting date/key interpretation.
+
+The scheduler CLI admits one bounded batch with --once or runs a local polling
+loop, owning its engine and using portable stop/drain/cancel handling. Continuous
+mode retries database outages; --once surfaces errors. Settings bound batch size,
+poll interval and shutdown grace. Deployment must choose managed invocation or
+appropriate always-running CPU for admission in milestone 15; local polling is
+not evidence that an idle Cloud Run service will execute background work.
+
+**Context:** Pub/Sub cannot be the authority for arbitrary delayed eligibility.
+An early duplicate ID must neither execute future work nor erase its future
+dispatch responsibility. Extending submission content must not break retained keys.
+
+**Alternatives:** In-process timers; immediately publishing future jobs and relying
+on repeated NACKs; a future-dated initial outbox with no explicit admission state;
+scheduler leases/network work in a transaction; recomputing existing fingerprints.
+
+**Reasoning:** Explicit scheduled intent gives the scheduler one cohesive database
+operation and keeps transport/execution boundaries unchanged. Atomic admission
+reuses the outbox, with no broker dependency or long-lived ownership. NULL omission
+provides an explicit compatibility rule for old keys without guessing old payloads
+after JSONB normalization.
+
+**Consequences:** A scheduler must run even for already-due timestamped submissions.
+The PostgreSQL clock defines eligibility; host wall clocks do not. Execution can
+be later due to polling/locks/outages/dispatch/capacity, and clock changes affect due
+eligibility. Original scheduling metadata has no retention/cleanup API yet; guarded
+downgrade is deliberately unavailable while it exists. Coordinated stopped-runtime
+upgrades remain required. No priority, cloud provisioning or new dependency is added.

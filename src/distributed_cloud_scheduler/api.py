@@ -126,7 +126,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ),
         ] = None,
     ) -> JobRead:
-        """Commit a job/outbox, or replay the current job for a matching submission key."""
+        """Commit immediate/scheduled intent, or replay the current job for its key."""
         if len(request.headers.getlist("Idempotency-Key")) > 1:
             raise HTTPException(status_code=422, detail="Supply one Idempotency-Key header")
         if idempotency_key is not None:

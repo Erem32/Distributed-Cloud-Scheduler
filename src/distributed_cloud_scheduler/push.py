@@ -84,6 +84,10 @@ async def _unclaimed_response(database: Database, job_id: UUID) -> Response:
             raise HTTPException(status_code=404, detail="Job not found")
         if job.status in TERMINAL_STATUSES:
             return Response(status_code=204)
+        if job.status is JobStatus.SCHEDULED:
+            # Admission intent survives both scheduler rollback and an early ACK.
+            # Successful admission commits a fresh outbox for subsequent delivery.
+            return Response(status_code=204)
         if job.status is JobStatus.RETRY_WAIT:
             now = cast(datetime, await session.scalar(select(func.clock_timestamp())))
             if job.next_attempt_at is not None and job.next_attempt_at > now:

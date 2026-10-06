@@ -1,11 +1,13 @@
 # Project status
 
-- **Current milestone:** 9 - dead-letter handling (COMPLETE).
-- **Current state:** Milestones 0-9 are validated locally. Dead-letter context and
-  generation-fenced manual recovery preserve submission identity and prior history;
-  648 tests pass without skips, and Windows/Linux live delivery smokes pass.
-- **Next objective:** Milestone 10 - delayed jobs and scheduler (NOT STARTED).
-- **Session boundary:** Milestone 9 is tied off; ask before starting milestone 10.
+- **Current milestone:** 10 - delayed jobs and scheduler (COMPLETE).
+- **Current state:** Milestones 0-10 pass their local acceptance criteria.
+  PostgreSQL 17/emulator are healthy; revision 0008 has no host/container schema
+  drift. The standard Python 3.13.1 checks pass all 762 tests without skips;
+  Windows and Linux scheduled delivery smokes pass.
+- **Next objective:** After authorization, design milestone 11's limited priority
+  policy, including ties, starvation and transport ordering limits.
+- **Session boundary:** Milestone 10 is complete; ask before starting milestone 11.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -25,14 +27,17 @@ operation-scoped. Explicit Alembic commands manage the schema; revision 0004 add
 the transactional dispatch outbox and backfills existing active jobs; revision
 0005 adds optional unique submission keys and paired request fingerprints; revision
 0006 adds retry due times and attempt history; revision 0007 adds generation fencing
-and final dead-letter context. The API runs
+and final dead-letter context; revision 0008 adds original scheduled dates and
+indexed SCHEDULED admission intent. The scheduler CLI admits bounded due batches
+using PostgreSQL locks, committing PENDING and a fresh outbox atomically. The API runs
 on Windows or in a non-root Python 3.12 container. GCP has no role in local startup.
 
 The publisher boundary and ID-specific execution path are exercised by real
 PostgreSQL tests and live Google SDK/emulator HTTP delivery smokes on Windows and
 Linux. Pub/Sub settings and SDK imports stay in transport/runtime modules.
 `LocalQueue` remains an in-process test adapter, not a shared CLI broker.
-POST /jobs commits new job/outbox obligations with HTTP 201, or returns the current
+POST /jobs commits immediate job/outbox or scheduled admission intent with HTTP 201,
+or returns the current
 job with 200 on matching keyed replay and 409 on conflicting content. Key metadata
 is internal; database uniqueness coordinates independent API replicas.
 Each claim inserts a history record. Transient outcomes with budget remaining
@@ -47,7 +52,8 @@ preserving immutable submission identity and every earlier attempt/obligation.
 ```mermaid
 flowchart LR
     Client --> API[FastAPI jobs, probes, OpenAPI]
-    API -->|Commit job and outbox together| DB[(PostgreSQL 17)]
+    API -->|Commit immediate dispatch or scheduled intent| DB[(PostgreSQL 17)]
+    Scheduler[Scheduler CLI] -->|Admit due jobs and commit outbox| DB
     Worker[Bounded concurrent local workers] -->|Claim and persist outcome| DB
     Worker --> Handlers[Bounded deterministic handlers]
     Dispatcher[Pub/Sub dispatcher CLI] -->|Lease and finalize outbox| DB
@@ -276,15 +282,43 @@ flowchart LR
 
 ## 10 - Delayed jobs and scheduler
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Dispatch only due jobs with restart-safe scheduling.
 - **Tasks:** scheduled_at support, due-row index/query, bounded scheduler batches and
   safe claims/reconciliation; introduce a scheduler runtime entry point.
-- **Design questions:** Multiple schedulers, UTC clock assumptions, transaction locks,
-  eventual precision and Cloud Run hosting that does not rely on background CPU.
-- **Acceptance:** Future jobs stay unexecuted; due jobs eventually dispatch despite
-  scheduler restarts; competing schedulers do not lose jobs.
-- **Validation:** Controlled-time tests, competing schedulers and crash-window integration tests.
+- **Design:** Optional scheduled_at is an aware datetime normalized to UTC. HTTP
+  input uses RFC 3339 with explicit offset/Z and at most six fractional digits;
+  naive/date-only/numeric/invalid/leap-second/UTC-overflow input is rejected. Past dates are
+  allowed. All non-NULL scheduled submissions enter SCHEDULED with no outbox;
+  the row itself is durable admission intent. Omitted/NULL dates keep immediate
+  PENDING + outbox behavior. No recurring schedules or schedule-edit API.
+- **Acceptance:** Scheduler schedule_due(database, limit=100) uses PostgreSQL clock,
+  ordered scheduled_at/id selection, a bounded 1..1000 batch and FOR UPDATE SKIP
+  LOCKED. In one transaction it changes due SCHEDULED rows to PENDING and inserts
+  exactly one current-generation outbox per admitted job. Rollback/cancellation
+  preserves scheduling intent; competing/restarted schedulers cannot double admit.
+  SCHEDULED never executes; initial-generation PENDING/QUEUED claims also guard the
+  original database due time. Early SCHEDULED ID deliveries ACK durable admission
+  intent even when due; admission commit supplies new dispatch, rollback retains
+  SCHEDULED. Active/due execution contention still NACKs. Automatic retries retain
+  next_attempt_at authority; manual recovery retains the original scheduled_at and
+  opens an immediate new generation. Public job reads expose the original UTC date.
+  Fingerprints omit NULL/absent scheduled_at, preserving all D011 hashes. Non-NULL
+  dates hash a normalized UTC ISO string with six fractional digits; equivalent
+  instants replay, different dates conflict, and the original digest remains immutable.
+  Scheduler CLI supports --once (one batch) or polling, portable stop/drain/cancel,
+  database outage retry and engine cleanup without broker imports. Settings bound
+  batch size, poll interval and shutdown timeout. Partial due index and migration
+  0008 preserve legacy rows; downgrade locks before checking and refuses while any
+  non-NULL scheduled_at remains, including completed jobs, protecting schedule/key
+  semantics. Hosted scheduler invocation/CPU policy is deferred to milestone 15.
+- **Validation:** Standard venv checks without skips; strict datetime/hash/config
+  and runtime tests; real PostgreSQL future/due gating, bounded ordered admission,
+  independent scheduler/worker/push races, restart, atomic rollback/cancellation,
+  keyed replay across upgrades, retry/manual recovery and stale generation fencing.
+  Migration round trips/direct constraints/concurrent downgrade guard, host/container
+  schema drift, and Windows/Linux live API -> scheduler CLI -> dispatcher -> SDK ->
+  emulator -> push smokes, including early ID ACK and restart before due admission.
 
 ## 11 - Priority scheduling
 
@@ -398,61 +432,57 @@ flowchart LR
 
 # Current milestone details
 
-Milestone 9 implements D013. Retryable execution exhaustion becomes DEAD_LETTERED
-with final safe error, database-clock timestamp and attempts_exhausted reason;
-permanent failures remain FAILED. Terminal duplicate push deliveries acknowledge
-without changing context/history. Existing retry timing and atomic history/outbox
-completion remain authoritative.
+Milestone 10 implements D014 with optional original scheduled_at, SCHEDULED
+admission intent, a due partial index, migration 0008 and a separate scheduler CLI.
+Aware RFC 3339 dates normalize to UTC; any non-NULL date requires scheduler
+admission, even if already due. Omitted/NULL dates preserve immediate behavior and
+all existing D011 fingerprints. Timestamped requests hash normalized UTC instants
+with six fractional digits; original dates and hashes survive execution/recovery.
 
-POST /jobs/{id}/retry requires expected_generation. One job row lock compares the
-current generation and eligible terminal state, then opens a new generation and
-immediate dispatch in the same transaction. It clears current outcome/timing and
-resets the original attempt budget while retaining immutable submission identity,
-earlier history and all publication records. Eight concurrent requests across
-independent API engines produce one winner. Delayed stale commands cannot reopen
-a later terminal generation. Failed/cancelled outbox insertion rolls back recovery.
+The scheduler samples PostgreSQL time, selects one bounded due batch in date/UUID
+order with FOR UPDATE SKIP LOCKED and atomically commits PENDING plus fresh current
+outbox obligations. No scheduler lease, broker import/network call or execution
+attempt is involved. Rollback/cancellation retains SCHEDULED; commit retains outbox
+through restart before publication. Multiple schedulers admit each row once.
 
-History keys are (job_id, generation, attempt_number). Public history has bounded
-limit/offset and optional generation filtering; generations have independent 1..20
-attempt budgets. Claims and outbox records carry generation, preventing stale
-completion/publication from altering reopened work. Old ID-only messages can claim
-the current eligible generation under normal ownership rules. No old outbox lock
-is taken while holding the manual retry job lock, preserving publisher lock order.
+SCHEDULED ID deliveries ACK durable admission intent, before or after due time,
+including during uncommitted admission. Initial PENDING/QUEUED execution also
+checks the original database due time. Automatic retries retain next_attempt_at;
+manual recovery retains the original schedule but starts an immediate generation.
+Defensive publication skips unadmitted SCHEDULED obligations. Continuous scheduler
+polling retries database outages; --once admits one batch and surfaces failure.
+Portable shutdown drains or cancels the current transaction before disposing its engine.
 
-Migration 0007 preserves existing rows/statuses as generation zero and leaves
-unknown legacy dead-letter context NULL. Downgrade locks all three tables before
-checking generation and refuses positive generations before removing any schema.
-Stop runtimes for migration; completed history and recovery intent must not be
-silently collapsed. No new dependency was required.
+Migration leaves all legacy rows/dates/hashes/history/obligations unchanged. Its
+locked downgrade guard refuses any retained original schedule, including completed
+work, to prevent silently losing date/key semantics. No new dependency, priority,
+recurrence, schedule editing or cloud resources were introduced.
 
 Validation completed on 2026-10-06:
 
-- Project venv python scripts/check.py: Ruff passed, strict mypy passed for 19
-  source files and **648 tests passed without skips** in 67.03 seconds on
-  Windows/Python 3.13.1 with PostgreSQL 17. Resumed baseline: 586 tests without skips.
-- Focused PostgreSQL recovery tests pass manual success/repeated failure, legacy
-  unknown context, generation-specific automatic retries, independent-engine CAS
-  races, stale commands/owners/publishers, keyed replay, rollback/cancellation,
-  terminal duplicate ACK, skipped obsolete outbox and 25-generation pagination.
-- All 19 PostgreSQL migration cases pass: generation-zero round trips, retained
-  historical lifecycles/ownership, CHECK/PK/FK/cascade constraints and downgrade
-  refusal. A real concurrent recovery blocks downgrade at its table lock, then
-  commits; the guard observes that generation and refuses without altering schema,
-  data or revision. The full chain also upgrades/downgrades to base and re-upgrades.
-- Application migrated to 0007; host and rebuilt container schema drift checks
-  report no new operations. Compose configuration, host/container pip dependency
-  checks and the rebuilt non-root container pass.
-- Windows/Python 3.13.1 and rebuilt Linux/Python 3.12.15 (UID 10001) live
-  API -> dispatcher -> Google SDK -> emulator -> push smokes pass worker-loss
-  dead-letter context -> manual HTTP retry -> generation 1 success, preserved
-  history/filter/pagination, old obligation skipped, keyed replay, duplicate ACK,
-  repeated recovery failure and stale command 409. Existing automatic retries,
-  exhaustion/permanent classification, submission identity, negative push responses
-  and broker outage/publication recovery probes remain green. Resources clean up.
+- Standard venv `python scripts/check.py`: Ruff passes, strict mypy passes for 20
+  source files and all 762 tests pass without skips in 102.10 seconds.
+- New scheduling/runtime unit tests and actual
+  PostgreSQL admission tests pass date/hash compatibility, bounded ordered batches,
+  independent replicas/worker/push races, locked-row progress, fixed clock cutoff,
+  whole-batch rollback/cancellation, durable early ACK, restart before publication,
+  due-time defense, original dates across automatic/manual recovery and legacy keys.
+- All 15 PostgreSQL migration cases pass NULL legacy preservation, repeated 0007
+  round trips, due index, scheduled-state constraints and downgrade refusal for
+  future/admitted/terminal schedules. A concurrent submission commits before the
+  locked guard and is preserved when downgrade refuses. Disposable metadata drift
+  checks pass; application is migrated to 0008 with no host/container drift.
+- Host/container pip checks and Compose configuration pass; the non-root Linux
+  image builds. Windows/Python 3.13.1 and Linux/Python 3.12.15 live API -> scheduler
+  CLI -> dispatcher CLI -> Google SDK -> emulator -> push smokes pass future
+  schedule/offset identity, early and due-unadmitted ID ACK without attempts/outbox,
+  separate scheduler/polling due gates, scheduler restart before due and after
+  admission, single persisted obligation and execution after due with original date.
+  Existing retries, recovery, replay/duplicate and broker outage probes stay green;
+  all disposable resources clean up.
 
-Broker DLQ is transport quarantine, separate from application execution exhaustion.
-Production DLQ policy/IAM/monitoring and cloud delivery validation remain milestone
-15; the local smoke does not configure broker dead-letter forwarding.
+Cloud scheduler invocation/CPU policy and broker DLQ/IAM remain deployment-stage
+validation in milestone 15. Local polling makes no cloud hosting claim.
 
 The roadmap is intentionally sequential. Basic atomic claiming is required before
 concurrency, and durable publication/reconciliation is required before Pub/Sub.
@@ -474,10 +504,11 @@ them and does not postpone correctness testing.
 - D011: global optional submission keys, original content fingerprints and atomic job/outbox replay.
 - D012: application attempt authority, persisted retry timing/history and atomic replacement dispatch.
 - D013: explicit dead-letter exhaustion, generation-fenced manual recovery and retained history.
+- D014: durable scheduled admission, database-clock eligibility and compatible schedule identity.
 
 # Risks / technical debt
 
-- Milestones 0-9's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
+- Milestones 0-10's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
   deployment-stage validation, not evidence supplied by the emulator.
 - No cloud environment or spending authorization has been established. Cloud rollout
   must not be claimed validated from local tests.
@@ -498,13 +529,14 @@ them and does not postpone correctness testing.
   upgrades are required; revision 0006 downgrade stops waiting retries and removes history/timing.
 - Milestone 9 introduces retry generations to retain history across budget resets;
   coordinated upgrade is required, and downgrade will be refused after manual recovery.
+- Original scheduled_at has no edit/retention API. Migration 0008 downgrade refuses
+  while any original date remains, including completed work. PostgreSQL clock defines
+  due eligibility; host clock, polling and broker ordering do not define execution time.
 - Host tests use Python 3.13.1; container runtime smokes use Python 3.12.15. This
   evidence does not establish a full Python-version test matrix.
 
 # Next actions
 
-1. Ask for authorization before starting milestone 10.
-2. If authorized, design delayed submissions and scheduler claims without changing
-   generation recovery, retry due gating or immutable submission fingerprints silently.
-3. Define scheduler acceptance/validation before implementation. Cloud provisioning
-   and broker DLQ policy/IAM remain milestone 15.
+1. Ask whether to start milestone 11; do not implement it before authorization.
+2. If authorized, define dispatch priority, ties and starvation policy before behavior.
+3. Keep cloud scheduler hosting and broker DLQ policy in milestone 15.

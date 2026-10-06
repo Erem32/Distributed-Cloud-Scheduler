@@ -49,7 +49,14 @@ async def _claim_available(
     async with database.session_factory() as session, session.begin():
         candidates = select(Job).where(
             or_(
-                Job.status.in_((JobStatus.PENDING, JobStatus.QUEUED)),
+                and_(
+                    Job.status.in_((JobStatus.PENDING, JobStatus.QUEUED)),
+                    or_(
+                        Job.generation > 0,
+                        Job.scheduled_at.is_(None),
+                        Job.scheduled_at <= func.clock_timestamp(),
+                    ),
+                ),
                 and_(
                     Job.status == JobStatus.RETRY_WAIT,
                     Job.next_attempt_at <= func.clock_timestamp(),

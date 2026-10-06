@@ -1,6 +1,7 @@
 """Persisted jobs, public schemas, and focused transactional data access."""
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -31,12 +32,17 @@ from distributed_cloud_scheduler.idempotency import (
 )
 
 MAX_PAYLOAD_BYTES = 64 * 1024
+_SCHEDULE_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
 
 
 class JobStatus(StrEnum):
     """Lifecycle vocabulary for persisted job transitions."""
 
     PENDING = "PENDING"
+    SCHEDULED = "SCHEDULED"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     RETRY_WAIT = "RETRY_WAIT"
@@ -57,6 +63,12 @@ class Job(Base):
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_object"),
         CheckConstraint("max_attempts BETWEEN 1 AND 20", name="max_attempts_range"),
         CheckConstraint("generation >= 0", name="generation_nonnegative"),
+        CheckConstraint(
+            "status <> 'SCHEDULED' OR (scheduled_at IS NOT NULL AND attempt_count = 0 "
+            "AND generation = 0 AND started_at IS NULL AND finished_at IS NULL "
+            "AND result_metadata IS NULL AND error_info IS NULL)",
+            name="scheduled_state",
+        ),
         CheckConstraint(
             "(dead_lettered_at IS NULL AND dead_letter_reason IS NULL) OR "
             "(status = 'DEAD_LETTERED' AND dead_lettered_at IS NOT NULL "
@@ -103,6 +115,10 @@ class Job(Base):
         UniqueConstraint("idempotency_key", name="uq_jobs_idempotency_key"),
         Index("ix_jobs_created_at_id", "created_at", "id"),
         Index(
+            "ix_jobs_scheduled_due", "scheduled_at", "id",
+            postgresql_where=text("status = 'SCHEDULED'"),
+        ),
+        Index(
             "ix_jobs_running_lease",
             "lease_expires_at",
             "id",
@@ -135,6 +151,7 @@ class Job(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -201,6 +218,38 @@ class JobCreate(BaseModel):
     type: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
     payload: dict[str, JsonValue]
     max_attempts: int = Field(default=3, ge=1, le=20)
+    scheduled_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "Original execution date: RFC 3339 with an offset and at most six fractional digits. "
+            "Every non-null date requires scheduler admission, including past dates."
+        ),
+        examples=["2030-01-01T12:00:00.000000Z"],
+    )
+
+    @field_validator("scheduled_at", mode="before")
+    @classmethod
+    def parse_schedule(cls, value: object) -> object:
+        """Accept aware datetimes or explicit RFC 3339 text, never epoch coercion."""
+        if value is None or isinstance(value, datetime):
+            return value
+        if not isinstance(value, str) or _SCHEDULE_TIMESTAMP.fullmatch(value) is None:
+            raise ValueError(
+                "scheduled_at must be RFC 3339 with an offset and microsecond precision"
+            )
+        try:
+            return datetime.fromisoformat(value.upper())
+        except ValueError:
+            raise ValueError("scheduled_at must be a valid RFC 3339 timestamp") from None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def normalize_schedule(cls, value: datetime | None) -> datetime | None:
+        """Choose one bounded UTC instant before persistence and request fingerprinting."""
+        try:
+            return value.astimezone(UTC) if value is not None else None
+        except (OverflowError, ValueError):
+            raise ValueError("scheduled_at must fit within the UTC datetime range") from None
 
     @field_validator("payload")
     @classmethod
@@ -222,6 +271,7 @@ class JobRead(BaseModel):
     started_at: AwareDatetime | None
     finished_at: AwareDatetime | None
     next_attempt_at: AwareDatetime | None = None
+    scheduled_at: AwareDatetime | None = None
     dead_lettered_at: AwareDatetime | None = None
     dead_letter_reason: str | None = None
     generation: int = 0
@@ -231,7 +281,8 @@ class JobRead(BaseModel):
     error_info: dict[str, JsonValue] | None = None
 
     @field_validator(
-        "created_at", "started_at", "finished_at", "next_attempt_at", "dead_lettered_at"
+        "created_at", "started_at", "finished_at", "next_attempt_at", "dead_lettered_at",
+        "scheduled_at",
     )
     @classmethod
     def normalize_timestamps(cls, value: datetime | None) -> datetime | None:
@@ -248,7 +299,7 @@ class JobList(BaseModel):
 
 
 async def create_job(session: AsyncSession, submission: JobCreate) -> Job:
-    """Commit a PENDING job and its dispatch obligation without publishing."""
+    """Commit immediate dispatch or durable scheduled admission intent without publishing."""
     # The outbox's dispatch functions use Job; defer this model import to avoid a cycle.
     from distributed_cloud_scheduler.outbox import DispatchOutbox
 
@@ -257,10 +308,17 @@ async def create_job(session: AsyncSession, submission: JobCreate) -> Job:
             type=submission.type,
             payload=submission.payload,
             max_attempts=submission.max_attempts,
+            scheduled_at=submission.scheduled_at,
+            status=(
+                JobStatus.SCHEDULED
+                if submission.scheduled_at is not None
+                else JobStatus.PENDING
+            ),
         )
         session.add(job)
         await session.flush()
-        session.add(DispatchOutbox(job_id=job.id))
+        if submission.scheduled_at is None:
+            session.add(DispatchOutbox(job_id=job.id))
         await session.flush()
         await session.refresh(job)
     return job
@@ -295,6 +353,12 @@ async def create_or_replay_job(
                 type=submission.type,
                 payload=submission.payload,
                 max_attempts=submission.max_attempts,
+                scheduled_at=submission.scheduled_at,
+                status=(
+                    JobStatus.SCHEDULED
+                    if submission.scheduled_at is not None
+                    else JobStatus.PENDING
+                ),
                 idempotency_key=key,
                 request_fingerprint=fingerprint,
             )
@@ -304,7 +368,8 @@ async def create_or_replay_job(
         job = (await session.scalars(statement)).one_or_none()
         created = job is not None
         if job is not None:
-            session.add(DispatchOutbox(job_id=job.id))
+            if submission.scheduled_at is None:
+                session.add(DispatchOutbox(job_id=job.id))
             await session.flush()
         else:
             # READ COMMITTED gives this separate statement a snapshot containing the

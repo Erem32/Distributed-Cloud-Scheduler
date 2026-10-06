@@ -4,7 +4,8 @@ A portfolio backend project focused on explainable distributed job execution,
 PostgreSQL transactions, delivery semantics and failure recovery. Development is
 local-first and follows validated milestones. The local foundation contains a
 FastAPI API, persisted jobs with optional submission idempotency, atomic execution,
-bounded execution retries, dead-letter context, manual recovery, attempt history
+scheduled jobs with a separate scheduler, bounded execution retries, dead-letter
+context, manual recovery, attempt history
 and durable dispatch obligations,
 PostgreSQL connectivity, explicit Alembic migrations, container setup and a
 Pub/Sub publisher/push worker validated with the local emulator. Cloud deployment
@@ -16,7 +17,8 @@ is planned work; see the
 ```mermaid
 flowchart LR
     Client --> API[FastAPI: jobs, probes, OpenAPI]
-    API -->|Commit job and outbox together| DB[(PostgreSQL)]
+    API -->|Commit immediate dispatch or scheduled intent| DB[(PostgreSQL)]
+    Scheduler[Scheduler CLI] -->|Admit due jobs and commit outbox| DB
     Worker[Local polling worker] -->|Claim and persist outcomes| DB
     Worker --> Tasks[Deterministic handlers]
     Dispatcher[Pub/Sub dispatcher CLI] -->|Lease and finalize outbox| DB
@@ -42,6 +44,8 @@ Revision 0006 adds durable retry timing and execution attempt history. Existing
 terminal jobs remain terminal; only known active ownership is backfilled.
 Revision 0007 adds recovery generations and final dead-letter context, retaining
 all existing records as generation zero without reclassifying historical failures.
+Revision 0008 adds original schedule timestamps, SCHEDULED admission intent and
+a partial due index. Legacy submissions keep NULL dates and their original hashes.
 
 The target cloud stack is GCP Pub/Sub, Cloud Run and Cloud SQL, added after local
 execution and concurrency have been proved. See the
@@ -109,7 +113,7 @@ and deployment follow later milestones.
 
 | Endpoint | Behavior |
 | --- | --- |
-| `POST /jobs` | `201` with a new job/outbox; matching `Idempotency-Key` replay returns current job with `200`, different content returns `409` |
+| `POST /jobs` | `201` persists immediate job/outbox or scheduled intent; matching `Idempotency-Key` replay returns current job with `200`, different content returns `409` |
 | `GET /jobs/{job_id}` | Persisted job or `404`; invalid UUID returns `422` |
 | `GET /jobs/{job_id}/attempts` | Paginated generation/attempt history; optional `generation` filter, default limit 20 |
 | `POST /jobs/{job_id}/retry` | `202` reopens FAILED/DEAD_LETTERED with required `expected_generation`; stale/ineligible retry returns `409` |
@@ -158,6 +162,8 @@ and fit within 64 KiB of compact UTF-8 JSON; non-finite numbers, NUL characters
 and invalid Unicode are rejected. `max_attempts` is an integer from 1 to 20
 (default 3). Extra submission fields are rejected. Stored timestamps are returned
 in UTC. Without an `Idempotency-Key`, repeated requests create separate jobs.
+Optional `scheduled_at` controls initial scheduler admission; see the scheduling
+section below for its timestamp format and runtime requirement.
 
 List `limit` is 1 through 100 (default 20); `offset` is 0 through 10,000 (default
 0). Ordering is deterministic within a database snapshot; offset pages can shift
@@ -183,6 +189,9 @@ driver cancellation/connection cleanup can add latency during network failures.
 | `DISPATCH_RETRY_MAX_SECONDS` | Finite value greater than 0 and at most 300, at least the retry base; default 60 |
 | `DISPATCH_POLL_INTERVAL_SECONDS` | Finite value greater than 0 and at most 10; default 0.5 |
 | `DISPATCH_SHUTDOWN_TIMEOUT_SECONDS` | Finite value greater than 0 and at most 60; default 20 |
+| `SCHEDULER_BATCH_SIZE` | Integer 1 through 1,000; default 100; maximum jobs admitted per transaction |
+| `SCHEDULER_POLL_INTERVAL_SECONDS` | Finite value greater than 0 and at most 10; default 0.5 |
+| `SCHEDULER_SHUTDOWN_TIMEOUT_SECONDS` | Finite value greater than 0 and at most 60; default 20 |
 | `PUBSUB_TOPIC` | Full `projects/.../topics/...` name; required only by the dispatcher |
 | `PUBSUB_SUBSCRIPTION` | Full `projects/.../subscriptions/...` name; required only by the push worker |
 | `PUBSUB_EMULATOR_HOST` | Optional `host:port` for local insecure emulator RPC; omit for GCP ADC/TLS |
@@ -204,10 +213,12 @@ Whitespace, empty values, non-ASCII characters and repeated header fields return
 422; the service does not trim or merge keys. Generate a unique key for each
 logical submission, then reuse it when retrying that submission.
 
-A new key returns 201 and atomically commits one job and one outbox obligation.
+A new key returns 201 and atomically commits one job with durable dispatch or
+scheduled admission intent. Immediate submissions have one outbox obligation;
+scheduled submissions gain that obligation during scheduler admission.
 Matching replay returns 200 with the same job's current state, including any
 completed result or failure. Reusing a key for different type, payload or
-`max_attempts` returns sanitized 409. Concurrent API replicas coordinate through
+`max_attempts` or original `scheduled_at` returns sanitized 409. Concurrent API replicas coordinate through
 PostgreSQL uniqueness; replay creates no new job/outbox or execution attempt.
 Rolled-back submissions, including cancellation during an unfinished insert,
 leave the key reusable. If a response is lost or commit acceptance is ambiguous,
@@ -220,6 +231,11 @@ and exact strings matter; Unicode is not normalized. Parsed numeric representati
 also matters: integer `1` differs from float `1.0`, and `-0.0` differs from `0.0`.
 Float spellings that parse identically match. Large integers retain their precision.
 The original fingerprint is stored independently of later JSONB/execution changes.
+NULL and omitted `scheduled_at` retain exactly the original immediate-submission
+fingerprint. Non-NULL dates add a UTC ISO string with six fractional digits;
+equivalent instants expressed with different offsets/fraction spellings match.
+The original schedule remains part of submission identity after admission,
+automatic retries and manual recovery.
 
 Keys remain bound while their jobs exist; there is no expiry or deletion/retention
 feature yet. Keys and fingerprints are internal and are absent from job responses.
@@ -237,6 +253,59 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/jobs -Method Post -Headers $headers
 
 Swagger exposes the optional header and the 200/201/409 responses. See
 [D011](docs/DECISIONS.md) for the transaction and normalization choices.
+
+## Scheduled jobs and scheduler
+
+Submit `scheduled_at` as RFC 3339 text with `T`, an explicit UTC `Z` or numeric
+offset, seconds and at most six fractional digits. For example:
+
+```powershell
+$scheduledBody = @{ type = 'calculation'; payload = @{ numbers = @(1, 2, 3) }; scheduled_at = [datetimeoffset]::UtcNow.AddSeconds(30).ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ') } | ConvertTo-Json
+$scheduledJob = Invoke-RestMethod -Uri http://127.0.0.1:8000/jobs -Method Post -ContentType 'application/json' -Body $scheduledBody
+```
+
+Dates normalize to UTC. Naive/date-only timestamps, numeric epochs, invalid
+calendar/offset values, leap seconds, excessive precision and UTC overflow return 422. Past
+dates are allowed. Any non-NULL date starts SCHEDULED, including an already-due
+date; NULL/omitted dates keep immediate PENDING submission behavior.
+
+Run the separate scheduler on the host or with the existing image:
+
+```text
+python -m distributed_cloud_scheduler.scheduler --once
+python -m distributed_cloud_scheduler.scheduler
+docker compose run --rm api python -m distributed_cloud_scheduler.scheduler --once
+```
+
+`--once` admits one bounded batch and exits; it does not wait for future jobs.
+Continuous mode drains due batches and polls when idle. The scheduler uses the
+PostgreSQL clock, locks due SCHEDULED jobs in scheduled_at/UUID order with
+`FOR UPDATE SKIP LOCKED`, and commits PENDING plus one immediate outbox per job in
+the same transaction. Skipped locked rows can be admitted on a later pass; this is
+admission order among available rows, without a global execution-order guarantee.
+Failed/cancelled transactions leave scheduled intent intact. Multiple schedulers
+and restarts cannot double admit a job. Admission itself consumes no execution
+attempt and performs no broker call.
+
+Run a dispatcher and push worker, or a polling worker, after admission. SCHEDULED
+jobs never execute, even if an old ID arrives after their due time. Push ACKs that
+durable admission intent; scheduler commit establishes fresh dispatch, and rollback
+keeps the intent for its next pass. Initial PENDING/QUEUED claims also check the
+original database due time. Retry backoff continues to use next_attempt_at;
+manual recovery retains scheduled_at but opens an immediate new generation.
+
+Scheduler shutdown stops new batches, drains the current transaction within the
+configured grace period and then cancels it. Database connection failures retry
+in continuous mode; `--once` reports failure with a nonzero exit. Scheduling is
+eventual: polling interval, locks, database outages, dispatch and worker capacity
+can delay execution beyond the requested instant. No recurrence or schedule-edit
+interface is provided. Cloud scheduler invocation/CPU policy remains milestone 15;
+an idle Cloud Run service is not assumed to run this polling loop.
+
+Migration 0008 preserves legacy jobs, keys and obligations. Stop runtimes before
+migrating. Downgrade takes table locks before checking and refuses while any job
+retains a non-NULL scheduled_at, even after completion, to protect original schedule
+and fingerprint semantics. See [D014](docs/DECISIONS.md).
 
 ## Local execution semantics
 
@@ -363,8 +432,10 @@ finish before that decision and cannot commit between the check and schema remov
 
 ## Durable dispatch boundary
 
-Job creation commits both the job and a READY `dispatch_outbox` row in one
-transaction. If either insert fails, neither persists. `dispatch_once` leases one
+Immediate job creation commits both the job and a READY `dispatch_outbox` row in one
+transaction. Scheduled creation persists SCHEDULED; due scheduler admission commits
+the state transition and its new READY outbox together. If either admission write
+fails, scheduled intent remains. `dispatch_once` leases one
 due obligation, calls an async `Publisher.publish(job_id)` outside the transaction,
 then records PUBLISHED using the current token and an unexpired lease. Transport
 acceptance is separate from job success. The job becomes QUEUED only if still
@@ -377,7 +448,8 @@ leave a PUBLISHING lease that can be reclaimed after expiry. A crash after trans
 acceptance but before the database marker can publish the same ID again. Both
 ID-specific delivery and polling use the same database claim rules, so duplicate
 deliveries cannot claim an already RUNNING or terminal job or increase its attempts.
-Outbox rows for terminal jobs or earlier recovery generations are explicitly SKIPPED.
+Outbox rows for terminal jobs, unadmitted SCHEDULED state or earlier recovery
+generations are explicitly SKIPPED.
 
 `LocalQueue` is a bounded, in-process test adapter with backpressure. Its messages
 do not survive process exit, and it is not a broker shared by CLI processes.
@@ -422,6 +494,7 @@ it cannot supply task data or execution attempts. Unwrapped delivery is unsuppor
 | --- | --- |
 | Committed success or classified failure; terminal duplicate | 204 ACK |
 | Committed RETRY_WAIT with replacement outbox; early retry duplicate | 204 ACK |
+| SCHEDULED ID before or after due time; durable scheduler admission intent | 204 ACK |
 | Expired target owner recovered to RETRY_WAIT or exhausted DEAD_LETTERED | 204 ACK |
 | Active ownership, row contention, full capacity or rejected completion | 503, redeliver |
 | Database failure or total request timeout | 503, redeliver |
@@ -471,6 +544,9 @@ success/failure duplicate ACKs, transient retry/backoff with an early duplicate,
 success on attempt 2, dead-letter exhaustion/context, permanent failure, generation
 history/filter/pagination, worker-loss recovery through manual retry and real
 delivery, stale retry conflicts, keyed replay and skipped obsolete obligations,
+future schedule/early ACK, UTC schedule identity, separate scheduler/worker due
+gating and scheduler restart before due and after admission, followed by live
+dispatcher delivery,
 malformed/unknown/oversized requests, and durable publication recovery after a
 broker connection failure.
 It removes its resources and fails when prerequisites or checks fail.
@@ -534,6 +610,10 @@ and explicitly validate the downgrade behavior for waiting retries.
 Recovery tests exercise concurrent manual commands, stale commands/owners/publishers,
 retained identity/history and atomic rollback/cancellation. Migration tests cover
 generation-zero round trips, dead-letter constraints and refusal of unsafe downgrade.
+Scheduling tests cover datetime/hash compatibility, bounded ordered admission,
+competing schedulers, locked-row progress, rollback/cancellation, durable restart,
+early push ACK, original dates across retry/recovery and scheduler resource cleanup.
+Migration tests preserve legacy NULL dates and refuse schedule identity loss.
 
 ## Engineering documents
 

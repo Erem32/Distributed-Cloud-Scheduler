@@ -48,19 +48,21 @@ The provisional final cloud design is:
 ```mermaid
 flowchart LR
     Client --> API[Cloud Run API]
-    API -->|Commit job and outbox together| DB[(Cloud SQL PostgreSQL)]
+    API -->|Commit immediate dispatch or scheduled intent| DB[(Cloud SQL PostgreSQL)]
     Dispatcher[Dispatcher: deployment TBD] -->|Lease durable obligations| DB
     Dispatcher -->|Publish job identifier| Queue[Pub/Sub topic]
     Queue --> Push[Authenticated push subscription]
     Push --> Worker[Cloud Run worker HTTP endpoint]
     Worker -->|Claim and persist outcome| DB
     Worker --> Tasks[Deterministic task handlers]
-    Scheduler[Scheduler: deployment TBD] -->|Discover due jobs and persist obligations| DB
+    Scheduler[Scheduler: deployment TBD] -->|Admit due jobs and commit outbox| DB
 ```
 
 Job persistence and message publication are separate operations. D009 selects a
-transactional outbox: commit the job and its dispatch obligation together, publish
-outside the transaction, and finalize publication with fenced ownership. A crash
+transactional outbox: immediate submissions commit the job and dispatch obligation
+together; scheduled submissions retain durable admission intent until D014's
+scheduler atomically commits due admission and its outbox. Publish outside the
+transaction, and finalize publication with fenced ownership. A crash
 after acceptance can replay publication, so workers must tolerate duplicate IDs.
 The cloud dispatcher and scheduler hosting model still requires deployment design.
 
@@ -68,13 +70,13 @@ PostgreSQL is the authoritative store of job state. Messages identify jobs;
 workers load authoritative data from the database. Transport adapters must not
 make cloud services a prerequisite for domain tests or local execution. Introduce
 an interface only when local and cloud implementations need a shared contract.
-Keep the API, worker, and eventual scheduler in one project; separate runtime
+Keep the API, worker, and scheduler in one project; separate runtime
 entry points do not imply independent microservice codebases.
 
 The push worker is a separate HTTP application from the submission API. Its
 `POST /pubsub/push` service interface receives wrapped Pub/Sub envelopes containing
-only a base64-encoded canonical job UUID. It acknowledges durable terminal outcomes
-or retry intent with a replacement outbox obligation,
+only a base64-encoded canonical job UUID. It acknowledges durable terminal outcomes,
+retry intent with a replacement outbox obligation, or scheduled admission intent,
 and requests redelivery while execution or dependency recovery remains outstanding.
 D010 defines bounded request execution and the initial acknowledgement policy;
 execution retry policy is separate. Production access requires private Cloud Run
@@ -102,6 +104,7 @@ result metadata where appropriate. Scheduled timestamps use explicit time zones.
 The initial lifecycle proposal is:
 
 ```text
+SCHEDULED -> PENDING (scheduler admission when due)
 PENDING -> QUEUED -> RUNNING -> SUCCEEDED
                        |----> RETRY_WAIT -> RUNNING (when due)
                        |----> FAILED (permanent)
@@ -119,6 +122,9 @@ D013 distinguishes terminal exhaustion from permanent failure and makes manual
 recovery generation-fenced: reset the execution budget while preserving all prior
 attempts and immutable submission identity. Broker dead-letter forwarding is
 transport quarantine and cannot determine the authoritative database job state.
+D014 makes an original scheduled_at part of immutable submission identity.
+Scheduled intent persists until due scheduler admission atomically creates dispatch;
+early messages cannot replace admission, and database timestamps govern eligibility.
 
 The eventual public API includes:
 

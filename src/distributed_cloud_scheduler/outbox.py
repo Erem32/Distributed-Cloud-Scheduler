@@ -144,7 +144,7 @@ async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClai
                 )
             ).one()
             if job.generation != row.generation or job.status in (
-                JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.DEAD_LETTERED
+                JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.DEAD_LETTERED, JobStatus.SCHEDULED
             ):
                 row.status = DispatchStatus.SKIPPED
                 row.claim_token = None
