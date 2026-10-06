@@ -426,7 +426,10 @@ async def test_cancellation_after_key_insert_rolls_back_job_and_key_before_retry
     ("submission", "terminal_status"),
     [
         (SUBMISSION, "SUCCEEDED"),
-        ({"type": "controlled_failure", "payload": {"fail_until_attempt": 3}}, "FAILED"),
+        (
+            {"type": "controlled_failure", "payload": {"fail_until_attempt": 3}, "max_attempts": 1},
+            "FAILED",
+        ),
     ],
 )
 async def test_replay_after_dispatch_execution_and_app_restart_returns_current_state(

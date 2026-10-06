@@ -129,17 +129,17 @@ The following choices govern this architecture:
   publication failures and expired publisher leases remain replayable.
 - **Ownership and recovery (D007/D008):** atomic database claims and fenced
   completion reject duplicate IDs while another worker owns execution. Expired
-  execution becomes an inspectable failure; automatic re-execution is deferred.
-- **Retry ownership:** application attempt count versus broker redelivery, HTTP
-  acknowledgements for terminal/transient outcomes, backoff, and exhaustion.
+  execution becomes an inspectable failure; D012 retries it while budget remains.
+- **Retry ownership (D012):** PostgreSQL counts application attempts, persists
+  backoff/history and atomically commits replacement dispatch before retry ACK.
 - **Dead-letter state:** broker forwarding versus application terminal state,
   reconciliation, and manual retry eligibility.
 - **Scheduling and priority:** due-job claiming, multiple schedulers, restart
   behavior, practical ordering limits, and a suitable scheduler deployment model.
 
-Retry ownership, dead-letter behavior and scheduling/priority remain open.
-D010 defines the initial HTTP acknowledgement policy without automatic execution
-retries. Later milestones must add specific decisions and regression tests.
+Dead-letter behavior and general scheduling/priority remain open. D010 defines
+the initial acknowledgement policy; D012 adds application retries and ACK after
+durable retry intent. Later milestones must add decisions and regression tests.
 Local outbox/ownership validation does not establish cloud delivery behavior.
 
 ## D005 - Portable development checks and API startup
@@ -236,6 +236,8 @@ local path. D009 adds QUEUED -> RUNNING and ID-specific claiming using the same
 ownership rules. A task exception, invalid task payload, timeout or expired owner is
 recorded as FAILED. Expired owners are made inspectable by worker polling;
 re-execution/backoff waits for the deliberate retry model in milestone 8.
+These initial terminal-error semantics are superseded by D012; its completion
+also finalizes attempt history and retry dispatch in the fenced transaction.
 Milestone 4 adds bounded concurrent work and graceful shutdown. Existing leases
 exceed the bounded task timeout by a margin; defer periodic renewal until longer
 execution requirements justify the extra moving part.
@@ -436,3 +438,69 @@ Migration 0005 adds only nullable metadata and constraints; downgrade removes
 idempotency bindings while preserving jobs/outbox. Duplicate deliveries across
 replicas and polling retain D010 acknowledgement behavior. No automatic execution
 retry or exactly-once external side-effect guarantee follows from submission identity.
+
+## D012 - PostgreSQL owns execution retries and their durable dispatch
+
+**Date:** 2026-10-06
+
+**Status:** Accepted for milestone 8; validation evidence recorded in PLAN
+
+**Decision:** Application attempts, recorded in PostgreSQL, govern execution retries.
+Broker deliveries and outbox publication attempts do not consume execution budgets.
+Each claim inserts one RUNNING job_attempts record atomically with ownership and
+attempt_count. Fenced completion or expired-owner recovery finalizes that record.
+Transient failures schedule RETRY_WAIT while budget remains; permanent failures
+and exhaustion become terminal FAILED. Worker loss, cancellation, handler timeout,
+internal error and controlled failure are transient; invalid payload/unknown task
+are permanent. DEAD_LETTERED and manual retry remain milestone 9.
+
+The outcome transaction persists next_attempt_at on job/history and adds a new
+outbox obligation available at that same time. Choose capped exponential equal
+jitter once: cap = min(base * 2^(attempt-1), maximum), delay in [cap/2, cap].
+Defaults are base 1 second and maximum 60 seconds; both accept 0.001-300 seconds
+to retain positive timing at database precision. Claims use the database clock
+and reject early retries even when an old message arrives. Publication leaves
+RETRY_WAIT intact; retry state changes only when a due claim succeeds. A restart
+or duplicate does not recalculate timing or consume a new attempt.
+
+Push ACKs both terminal outcomes and committed RETRY_WAIT, including early retry
+duplicates. Its new outbox obligation survives a lost ACK or process restart.
+Active ownership/contention, failed/expired completion and dependency failures
+still return 503. This supersedes D010's terminal-only ACK and terminal treatment
+of retryable errors; envelope, admission and timeout boundaries stay unchanged.
+Expired recovery schedules only the delivered job in push and a bounded batch in
+polling, retaining token/lease fencing. No execution sleeps inside a request to
+wait for retry backoff, and no background task is needed to retain retry intent.
+After flushing outcome/history/outbox writes, completion rechecks the database
+clock and rolls back if its lease elapsed during a write lock wait. A due retry
+whose claim is locked remains a 503 rather than acknowledging uncommitted ownership.
+
+Expose next_attempt_at in job reads and ordered attempt history through
+GET /jobs/{id}/attempts, bounded by the current 20-attempt maximum. Ownership
+tokens remain internal. History begins with this migration; backfill only known
+active RUNNING ownership, never fabricate completed pre-migration attempts.
+Existing FAILED jobs remain terminal. Downgrade maps newly waiting retries to
+FAILED before restoring the old lifecycle and removes timing/history; it retains
+all other job fields and all publication records.
+
+**Context:** Broker redelivery alone cannot provide an authoritative application
+attempt budget or restart-stable backoff. A retry ACK without durable replacement
+dispatch could strand work; leaving a transient message outstanding can cause
+unnecessary requests while the application backoff is pending.
+
+**Alternatives:** Broker delivery count as authority; NACK until backoff elapsed;
+in-process timers; a new retry scheduler/runtime; resetting an existing outbox row.
+
+**Reasoning:** New delayed obligations reuse the tested outbox without letting a
+publisher for the previous attempt finalize a new generation. A dedicated wait
+state separates execution eligibility from publication state and protects due
+gating across transport/polling races. One atomic outcome transaction preserves
+history, job state and retry intent through partial failure.
+
+**Consequences:** A dispatcher must run for push retries to progress; polling can
+claim due retries directly. New obligations may be skipped after polling completes
+the job. Independent replicas may have different settings, but the committing
+finalizer's persisted due time governs the next attempt. Clock and lock contention
+can delay execution beyond the due time. Retries may repeat handler side effects;
+ownership fencing still does not establish exactly-once external effects. Migration
+requires coordinated runtime upgrades; old binaries cannot interpret RETRY_WAIT.

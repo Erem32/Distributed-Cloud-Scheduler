@@ -1,11 +1,11 @@
 # Project status
 
-- **Current milestone:** 7 - submission idempotency and duplicate delivery (COMPLETE).
-- **Current state:** Milestones 0-7 are validated locally. Optional submission keys
-  resolve matching replay/conflicts atomically in PostgreSQL; independent delivery
-  engines and polling preserve one owned attempt. Windows/Linux live smokes pass.
-- **Next objective:** Milestone 8 - failure and retry semantics (NOT STARTED).
-- **Session boundary:** Milestone 7 is tied off; ask before starting milestone 8.
+- **Current milestone:** 8 - failure and retry semantics (COMPLETE).
+- **Current state:** Milestones 0-8 are validated locally. PostgreSQL owns bounded
+  execution retries, persisted due times and attempt history. Retry state/history/
+  outbox commit atomically; Windows/Linux live delivery smokes pass.
+- **Next objective:** Milestone 9 - dead-letter handling (NOT STARTED).
+- **Session boundary:** Milestone 8 is tied off; ask before starting milestone 9.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -23,7 +23,8 @@ workers, a Pub/Sub dispatcher CLI and a separate HTTP push worker. API/worker
 resources belong to lifespan; async SQLAlchemy sessions are
 operation-scoped. Explicit Alembic commands manage the schema; revision 0004 adds
 the transactional dispatch outbox and backfills existing active jobs; revision
-0005 adds optional unique submission keys and paired request fingerprints. The API runs
+0005 adds optional unique submission keys and paired request fingerprints; revision
+0006 adds retry due times and attempt history. The API runs
 on Windows or in a non-root Python 3.12 container. GCP has no role in local startup.
 
 The publisher boundary and ID-specific execution path are exercised by real
@@ -33,6 +34,10 @@ Linux. Pub/Sub settings and SDK imports stay in transport/runtime modules.
 POST /jobs commits new job/outbox obligations with HTTP 201, or returns the current
 job with 200 on matching keyed replay and 409 on conflicting content. Key metadata
 is internal; database uniqueness coordinates independent API replicas.
+Each claim inserts a history record. Transient outcomes with budget remaining
+commit RETRY_WAIT and a new delayed outbox; polling and delivery only claim due
+retries. Push ACKs committed retry intent and early duplicates, but due contention
+remains 503. GET /jobs/{id}/attempts exposes ordered history without ownership tokens.
 
 ```mermaid
 flowchart LR
@@ -193,15 +198,36 @@ flowchart LR
 
 ## 8 - Failure and retry semantics
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Make one deliberate model control execution attempts.
 - **Tasks:** Decide retry authority before implementation; record attempt history,
   classify transient/permanent errors, cap attempts and add backoff with bounded jitter.
 - **Design questions:** Application attempts vs broker delivery attempts, durable retry
   scheduling, acknowledgement after failure, leases and retry storms.
-- **Acceptance:** Attempt budgets and transitions remain correct across duplicates and
-  crashes; transient retries respect backoff; permanent errors do not loop forever.
-- **Validation:** Deterministic clock/backoff tests and retry/crash integration scenarios.
+- **Acceptance:** PostgreSQL owns execution attempts independently of broker delivery
+  and publication counts. Each committed claim creates one RUNNING attempt record;
+  completion or expired-owner recovery finalizes that record atomically with job state.
+  Retryable errors (controlled failure, timeout, internal error, cancellation and
+  worker loss) schedule RETRY_WAIT only while attempt_count < max_attempts; otherwise
+  FAILED is terminal. Invalid payload/unknown task are permanent and never retried.
+  A scheduled retry commits next_attempt_at and a new outbox obligation with that
+  same due time in the outcome transaction. Polling and ID claims cannot execute
+  before the database due time. Duplicates cannot move due times, add history,
+  consume attempts early or overwrite a newer attempt. Old publisher finalization
+  cannot bypass due gating. Equal jitter stays within half/full capped exponential
+  delay, chosen once and persisted; restart does not recompute it.
+  Push returns 204 after committed terminal state or durable RETRY_WAIT, including
+  early retry duplicates; active ownership/contention, lost completion, timeout and
+  database failures remain 503. Stale tokens stay fenced across retries/recovery.
+  GET /jobs/{id}/attempts returns ordered bounded history without ownership tokens;
+  job responses include next_attempt_at. Migration preserves existing jobs/outbox,
+  leaves historical terminal jobs terminal and backfills only known active ownership.
+  No manual retry, dead-letter policy, general delayed submissions or cloud resources.
+- **Validation:** Pure backoff/config/classification tests; real PostgreSQL transient
+  success, exhaustion/permanent failures, due gating, replicas/polling/push races,
+  outcome/outbox/history rollback, restart, crash/lease recovery and stale finalization;
+  migration upgrade/downgrade/re-upgrade and constraints; standard venv checks without
+  skips, host/container schema drift and live Windows/Linux emulator retry smokes.
 
 ## 9 - Dead-letter handling
 
@@ -339,64 +365,63 @@ flowchart LR
 
 # Current milestone details
 
-Milestone 7 adds nullable `jobs.idempotency_key` and `request_fingerprint` columns.
-A unique case-sensitive key plus paired NULL/format CHECK constraints enforce the
-database boundary; existing jobs receive NULL metadata. No separate key table,
-expiration, user scope or job deletion feature is introduced. Keys last as long
-as their jobs. Use an optional single ASCII header; reject duplicate fields even
-if their values match. Keep key/fingerprint internal to persistence.
+Milestone 8 implements D012 with a transport-independent RetryPolicy, RETRY_WAIT
+and next_attempt_at, job_attempts history and migration 0006. Equal jitter uses
+half/full capped exponential delay (defaults 1/60 seconds; settings 0.001-300).
+Each claim atomically increments its attempt count and records ownership. Completion
+and expired-owner recovery finalize history and commit job state plus a new
+outbox obligation available at the persisted due time. Permanent/exhausted errors
+become FAILED; old FAILED jobs remain terminal.
 
-Fingerprint the validated JobCreate, including the effective max_attempts default,
-using SHA-256 of sorted-key compact UTF-8 JSON. Object order, insignificant request
-whitespace and Unicode escape spelling do not matter. Strings are exact without
-Unicode normalization, arrays remain ordered, and parsed integer/float/signed-zero
-representations stay distinct. This is an application contract, not RFC 8785;
-do not coerce large integers to binary64 or recompute hashes from normalized JSONB.
+Publication leaves RETRY_WAIT intact. Future old deliveries ACK durable intent;
+due contention, active ownership and failed completion request redelivery.
+Polling and ID-specific claims use the database due time. Completion samples the
+database clock after the job lock and again after flushing all outcome writes,
+rolling back if a history/outbox lock wait outlived its lease. Retry scheduling
+never relies on sleeping in a request or an in-process background timer.
 
-Inside one transaction use PostgreSQL INSERT ... ON CONFLICT (idempotency_key)
-DO NOTHING RETURNING. Only a winning insert creates the existing outbox obligation.
-A losing insert reads the key in a separate statement at READ COMMITTED, compares
-the original fingerprint and returns current state or a conflict. A combined CTE
-can miss a concurrent winner's commit because it has one snapshot; avoid no-op
-updates and broad IntegrityError handling. Preserve create_job's existing Job return
-contract and add a focused submission result for the API's 201/200 distinction.
-
-`idempotency.py` owns pure key/fingerprint rules; `jobs.create_or_replay_job` returns
-a new/replayed SubmissionResult while preserving the existing create_job interface.
-The API validates the optional header and documents 200/201/409 in OpenAPI.
-Revision 0005 preserves job/outbox fields through upgrade and removes only metadata
-on downgrade. Duplicate evidence now covers independent push app engines, restart
-and polling without altering M6's ACK rules. No new dependency was introduced.
+Public jobs expose next_attempt_at; GET /jobs/{id}/attempts returns up to 20
+ordered records without claim tokens/payloads. finished_at describes the latest
+attempt even during retry wait, and is reset on the next claim. Revision 0006
+backfills only known positive-count RUNNING ownership; completed historical
+records are not fabricated. Downgrade maps waiting retries to FAILED and removes
+timing/history, preserving other job fields and all publication records. No
+manual retry, dead-letter forwarding, general scheduling or cloud provisioning
+was introduced. No new dependency was required.
 
 Validation completed on 2026-10-06:
 
-- Project venv `python scripts/check.py`: Ruff passed; strict mypy passed for 16
-  source files; **490 tests passed without skips** on Windows/Python 3.13.1 and
-  PostgreSQL 17. The resumed M6 baseline also passed all 392 tests without skips.
-- Canonicalization/header/OpenAPI tests cover nested ordering, Unicode/defaults,
-  exact numeric/string distinctions, large integers, boundary keys, repeated fields,
-  sanitization and hidden metadata. Real PostgreSQL tests assert one job/outbox
-  across independent API engines, matching/conflicting submissions and terminal replay.
-- Unique-index contention is observed through pg_blocking_pids before winner
-  commit/rollback. Both matching/conflicting waiters resolve correctly. A failed
-  outbox insert and cancellation while its real INSERT is blocked roll back the
-  newly keyed job; subsequent submission succeeds with the same key.
-- Independent push engines and restarted apps preserve success/failure outcomes;
-  polling-versus-push contenders in both directions keep one execution attempt.
-- Migration 0004 -> 0005 -> 0004 -> 0005 preserves existing job/outbox snapshots,
-  including RUNNING ownership and accepted publication. Direct metadata pairing,
-  key/fingerprint format, case-sensitive uniqueness and multiple unkeyed rows pass.
-  Full migration round trips and original outbox backfill regressions pass.
-- Application DB migrated to 0005; host and rebuilt container `alembic check` find
+- Project venv python scripts/check.py: Ruff passed, strict mypy passed for 18
+  source files, and **586 tests passed without skips** on Windows/Python 3.13.1
+  with PostgreSQL 17. The resumed baseline passed 490 tests without skips.
+- Pure policy/config tests cover exponential growth, positive jitter bounds,
+  hard caps, single sampling and invalid timing; existing classification and
+  sanitization tests remain valid.
+- Real PostgreSQL tests cover transient success, permanent failure and exact
+  exhaustion at budgets 1/3/20, ordered history, atomic outcome/dispatch rollback,
+  rejected claim-history insertion, persisted early due gating and keyed replay.
+- Eight independent-engine polling/delivery contenders admit one due attempt.
+  Old publication cannot accelerate a waiting retry. Restarted push workers ACK
+  early duplicates without changing dates/history; due locked retries NACK.
+- Concurrent expired completion/recoverers finalize once; stale owners cannot
+  overwrite a new attempt. A real outbox INSERT lock wait past the lease rolls
+  back outcome/history/retry intent. Independent-process crash recovery schedules
+  durable retry and a new worker succeeds while preserving attempt accounting.
+- Migration 0005 -> 0006 -> 0005 -> 0006 preserves historical jobs/outbox and
+  backfills only known active ownership. Legacy positive-count owners complete
+  and recover through production functions after upgrade. Waiting-retry downgrade
+  and direct schedule/history/PK/FK/cascade constraints pass.
+- Application DB migrated to 0006; host and rebuilt container alembic check find
   no drift. Compose configuration and dependency consistency checks pass.
-- Windows host and Linux Python 3.12.15 image (UID 10001) live API/emulator smokes
-  pass keyed 201/200/409, terminal current replay, nested canonical/default matching,
-  independent no-key submissions, real SDK/push result 42 and one keyed job/outbox/
-  attempt. Existing failure/duplicate ACKs, malformed/unknown/oversized messages and
-  broker outage/publication recovery remain valid. Smokes remove their resources.
+- Final Windows and rebuilt Linux Python 3.12.15 image (UID 10001) live
+  API -> dispatcher -> Google SDK -> emulator -> push smokes pass transient
+  RETRY_WAIT/ACK, early duplicate/due gating, success on attempt 2, exhaustion at
+  max_attempts 2, permanent unknown-task failure and ordered token-free history.
+  Earlier idempotency, failure/duplicate ACK, malformed/unknown/oversized envelope
+  and broker outage/publication recovery probes pass. Disposable resources clean up.
 
-Cloud credentials, IAM and provisioning remain outside this milestone. FAILED
-jobs are still terminal; execution retry authority is the next milestone's design.
+Cloud IAM/provisioning remain deployment-stage validation. Manual retry and
+dead-letter responsibilities are the next milestone's design.
 
 The roadmap is intentionally sequential. Basic atomic claiming is required before
 concurrency, and durable publication/reconciliation is required before Pub/Sub.
@@ -416,14 +441,15 @@ them and does not postpone correctness testing.
 - D009: transactional dispatch outbox, replayable publication and separate attempt budgets.
 - D010: separate Pub/Sub runtimes, bounded push requests and ACK after durable terminal state.
 - D011: global optional submission keys, original content fingerprints and atomic job/outbox replay.
+- D012: application attempt authority, persisted retry timing/history and atomic replacement dispatch.
 
 # Risks / technical debt
 
-- Milestones 0-7's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
+- Milestones 0-8's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
   deployment-stage validation, not evidence supplied by the emulator.
 - No cloud environment or spending authorization has been established. Cloud rollout
   must not be claimed validated from local tests.
-- Cloud IAM, execution retry authority, dead-letter mapping, dispatcher/scheduler
+- Cloud IAM, dead-letter mapping, dispatcher/scheduler
   hosting and priority semantics still need deployment/reliability decisions.
 - `LocalQueue` loses buffered messages on process exit. The outbox is durable, but
   marking acceptance requires a transport whose acceptance guarantees fit deployment.
@@ -434,13 +460,19 @@ them and does not postpone correctness testing.
   an explicit compatibility decision for existing key bindings.
 - At-least-once delivery does not imply exactly-once external side effects. Keep handlers
   deterministic while ownership and failure semantics are developed.
+- History begins at migration 0006; only known active ownership is backfilled.
+  A legacy RUNNING record with zero attempts was never produced by application
+  claims and requires investigation rather than invented history. Coordinated
+  upgrades are required; downgrade stops waiting retries and removes history/timing.
+- Milestone 9 must decide a lifetime attempt ordinal or retry generations before
+  manual budget resets; resetting attempt_count would collide with retained history.
 - Host tests use Python 3.13.1; container runtime smokes use Python 3.12.15. This
   evidence does not establish a full Python-version test matrix.
 
 # Next actions
 
-1. Ask for authorization to begin milestone 8; do not start it before the user agrees.
-2. If authorized, decide execution retry authority, attempt history, retryable versus
-   permanent failure, durable backoff and acknowledgement policy before implementation.
-3. Preserve submission identity, atomic outbox publication and shared ownership;
-   validate retry/crash races before advancing. Cloud provisioning remains milestone 15.
+1. Ask for authorization to begin milestone 9; do not start it before the user agrees.
+2. If authorized, decide application/broker dead-letter responsibilities, manual
+   retry eligibility, history generations and budget-reset semantics before implementation.
+3. Preserve retry timing, submission identity, publication fencing and attempt
+   history through manual recovery races. Cloud provisioning remains milestone 15.

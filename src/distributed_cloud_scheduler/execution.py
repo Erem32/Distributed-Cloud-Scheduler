@@ -6,10 +6,16 @@ from typing import cast
 from uuid import UUID, uuid4
 
 from pydantic import JsonValue
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from distributed_cloud_scheduler.attempts import AttemptStatus, JobAttempt
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.jobs import Job, JobStatus, validate_json_object
+from distributed_cloud_scheduler.outbox import DispatchOutbox
+from distributed_cloud_scheduler.retries import RetryPolicy
+
+DEFAULT_RETRY_POLICY = RetryPolicy()
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +30,7 @@ class Claim:
 
 
 async def claim_pending(database: Database, lease_seconds: int) -> Claim | None:
-    """Claim the oldest pending or queued job without holding its lock during execution."""
+    """Claim available work, including due retries, without a long execution transaction."""
     return await _claim_available(database, lease_seconds)
 
 
@@ -41,16 +47,19 @@ async def _claim_available(
         raise ValueError("lease_seconds must be a positive integer")
     async with database.session_factory() as session, session.begin():
         candidates = select(Job).where(
-            Job.status.in_((JobStatus.PENDING, JobStatus.QUEUED)),
+            or_(
+                Job.status.in_((JobStatus.PENDING, JobStatus.QUEUED)),
+                and_(
+                    Job.status == JobStatus.RETRY_WAIT,
+                    Job.next_attempt_at <= func.clock_timestamp(),
+                ),
+            ),
             Job.attempt_count < Job.max_attempts,
         )
         if job_id is not None:
             candidates = candidates.where(Job.id == job_id)
         job = await session.scalar(
-            candidates
-            .order_by(Job.created_at, Job.id)
-            .limit(1)
-            .with_for_update(skip_locked=True)
+            candidates.order_by(Job.created_at, Job.id).limit(1).with_for_update(skip_locked=True)
         )
         if job is None:
             return None
@@ -60,10 +69,19 @@ async def _claim_available(
         job.claim_token = token
         job.started_at = now
         job.finished_at = None
+        job.next_attempt_at = None
         job.lease_expires_at = now + timedelta(seconds=lease_seconds)
         job.attempt_count += 1
         job.result_metadata = None
         job.error_info = None
+        session.add(
+            JobAttempt(
+                job_id=job.id,
+                attempt_number=job.attempt_count,
+                claim_token=token,
+                started_at=now,
+            )
+        )
         await session.flush()
         await session.refresh(job)
         claim = Claim(job.id, job.type, job.payload, job.attempt_count, token)
@@ -76,6 +94,7 @@ async def complete_claim(
     *,
     result: dict[str, JsonValue] | None = None,
     error: dict[str, JsonValue] | None = None,
+    retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
 ) -> bool:
     """Commit one outcome only while the token still owns an unexpired RUNNING job."""
     if (result is None) == (error is None):
@@ -86,77 +105,122 @@ async def complete_claim(
         validate_json_object(error, "error info")
     async with database.session_factory() as session, session.begin():
         # Acquire the lock first: the lease may expire while waiting behind another transaction.
-        locked_id = await session.scalar(
-            select(Job.id)
+        job = await session.scalar(
+            select(Job)
             .where(
                 Job.id == claim.id,
                 Job.status == JobStatus.RUNNING,
                 Job.claim_token == claim.token,
+                Job.attempt_count == claim.attempt_count,
             )
             .with_for_update()
         )
-        if locked_id is None:
+        if job is None:
             return False
-        completed_id = await session.scalar(
-            update(Job)
-            .where(
-                Job.id == claim.id,
-                Job.status == JobStatus.RUNNING,
-                Job.claim_token == claim.token,
-                Job.lease_expires_at > func.clock_timestamp(),
-            )
-            .values(
-                status=JobStatus.SUCCEEDED if result is not None else JobStatus.FAILED,
-                finished_at=func.clock_timestamp(),
-                claim_token=None,
-                lease_expires_at=None,
-                result_metadata=result,
-                error_info=error,
-            )
-            .returning(Job.id)
-        )
-    return completed_id is not None
+        attempt = await _current_attempt(session, job)
+        now = cast(datetime, await session.scalar(select(func.clock_timestamp())))
+        if job.lease_expires_at is None or job.lease_expires_at <= now:
+            return False
+        lease_deadline = job.lease_expires_at
+        _finish_attempt(session, job, attempt, now, result, error, retry_policy)
+        await session.flush()
+        # History/outbox writes may wait on locks too. Roll back the entire outcome
+        # if that wait outlived ownership; a later recovery still sees RUNNING.
+        finalized_at = cast(datetime, await session.scalar(select(func.clock_timestamp())))
+        if finalized_at >= lease_deadline:
+            await session.rollback()
+            return False
+    return True
+
+
+async def _current_attempt(session: AsyncSession, job: Job) -> JobAttempt:
+    """A job's locked owner must match its atomically inserted history record."""
+    attempt = await session.get(JobAttempt, (job.id, job.attempt_count))
+    if (
+        attempt is None
+        or attempt.claim_token != job.claim_token
+        or attempt.status is not AttemptStatus.RUNNING
+    ):
+        raise RuntimeError("Running ownership has no matching attempt record")
+    return attempt
+
+
+def _finish_attempt(
+    session: AsyncSession,
+    job: Job,
+    attempt: JobAttempt,
+    now: datetime,
+    result: dict[str, JsonValue] | None,
+    error: dict[str, JsonValue] | None,
+    retry_policy: RetryPolicy,
+) -> None:
+    """Keep outcome, history and replacement dispatch in one locked transaction."""
+    retry_at = None
+    if (
+        error is not None
+        and error.get("retryable") is True
+        and job.attempt_count < job.max_attempts
+    ):
+        retry_at = now + timedelta(seconds=retry_policy.delay_seconds(job.attempt_count))
+        session.add(DispatchOutbox(job_id=job.id, available_at=retry_at))
+    job.status = (
+        JobStatus.RETRY_WAIT
+        if retry_at is not None
+        else JobStatus.SUCCEEDED
+        if result is not None
+        else JobStatus.FAILED
+    )
+    job.finished_at = now
+    job.next_attempt_at = retry_at
+    job.claim_token = None
+    job.lease_expires_at = None
+    job.result_metadata = result
+    job.error_info = error
+    attempt.status = AttemptStatus.SUCCEEDED if result is not None else AttemptStatus.FAILED
+    attempt.finished_at = now
+    attempt.next_attempt_at = retry_at
+    attempt.result_metadata = result
+    attempt.error_info = error
 
 
 async def recover_expired(
-    database: Database, limit: int = 100, *, job_id: UUID | None = None
+    database: Database,
+    limit: int = 100,
+    *,
+    job_id: UUID | None = None,
+    retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
 ) -> int:
-    """Fail a bounded batch or one delivered expired owner without execution retries."""
+    """Finalize expired attempts and durably retry a bounded batch or delivered owner."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be an integer between 1 and 1000")
     async with database.session_factory() as session, session.begin():
-        candidates = select(Job.id).where(
+        candidates = select(Job).where(
             Job.status == JobStatus.RUNNING,
             Job.lease_expires_at <= func.clock_timestamp(),
         )
         if job_id is not None:
             candidates = candidates.where(Job.id == job_id)
-        expired_ids = list(
+        expired_jobs = list(
             await session.scalars(
-                candidates
-                .order_by(Job.lease_expires_at, Job.id)
+                candidates.order_by(Job.lease_expires_at, Job.id)
                 .limit(limit)
                 .with_for_update(skip_locked=True)
             )
         )
-        if not expired_ids:
+        if not expired_jobs:
             return 0
-        recovered_ids = await session.scalars(
-            update(Job)
-            .where(
-                Job.id.in_(expired_ids),
-                Job.status == JobStatus.RUNNING,
-                Job.lease_expires_at <= func.clock_timestamp(),
+        for job in expired_jobs:
+            attempt = await _current_attempt(session, job)
+            now = cast(datetime, await session.scalar(select(func.clock_timestamp())))
+            _finish_attempt(
+                session,
+                job,
+                attempt,
+                now,
+                None,
+                {"code": "worker_lost", "retryable": True},
+                retry_policy,
             )
-            .values(
-                status=JobStatus.FAILED,
-                finished_at=func.clock_timestamp(),
-                claim_token=None,
-                lease_expires_at=None,
-                result_metadata=None,
-                error_info={"code": "worker_lost", "retryable": True},
-            )
-            .returning(Job.id)
-        )
-        recovered_count = len(list(recovered_ids))
+        await session.flush()
+        recovered_count = len(expired_jobs)
     return recovered_count

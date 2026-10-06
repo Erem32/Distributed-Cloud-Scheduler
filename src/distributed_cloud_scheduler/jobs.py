@@ -39,6 +39,7 @@ class JobStatus(StrEnum):
     PENDING = "PENDING"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    RETRY_WAIT = "RETRY_WAIT"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     DEAD_LETTERED = "DEAD_LETTERED"
@@ -72,6 +73,12 @@ class Job(Base):
             "error_info IS NULL OR jsonb_typeof(error_info) = 'object'", name="error_info_object"
         ),
         CheckConstraint(
+            "(status = 'RETRY_WAIT' AND next_attempt_at IS NOT NULL "
+            "AND attempt_count > 0 AND attempt_count < max_attempts) OR "
+            "(status <> 'RETRY_WAIT' AND next_attempt_at IS NULL)",
+            name="retry_wait_schedule",
+        ),
+        CheckConstraint(
             "(idempotency_key IS NULL AND request_fingerprint IS NULL) OR "
             "(idempotency_key IS NOT NULL AND request_fingerprint IS NOT NULL)",
             name="idempotency_metadata_paired",
@@ -93,6 +100,12 @@ class Job(Base):
             "lease_expires_at",
             "id",
             postgresql_where=text("status = 'RUNNING'"),
+        ),
+        Index(
+            "ix_jobs_retry_due",
+            "next_attempt_at",
+            "id",
+            postgresql_where=text("status = 'RETRY_WAIT'"),
         ),
     )
 
@@ -116,6 +129,7 @@ class Job(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
@@ -195,12 +209,13 @@ class JobRead(BaseModel):
     created_at: AwareDatetime
     started_at: AwareDatetime | None
     finished_at: AwareDatetime | None
+    next_attempt_at: AwareDatetime | None = None
     attempt_count: int
     max_attempts: int
     result_metadata: dict[str, JsonValue] | None = None
     error_info: dict[str, JsonValue] | None = None
 
-    @field_validator("created_at", "started_at", "finished_at")
+    @field_validator("created_at", "started_at", "finished_at", "next_attempt_at")
     @classmethod
     def normalize_timestamps(cls, value: datetime | None) -> datetime | None:
         """Keep responses in UTC even if a database session uses another time zone."""
@@ -277,9 +292,7 @@ async def create_or_replay_job(
         else:
             # READ COMMITTED gives this separate statement a snapshot containing the
             # winner whose uncommitted unique-index entry may have blocked our INSERT.
-            job = (
-                await session.scalars(select(Job).where(Job.idempotency_key == key))
-            ).one()
+            job = (await session.scalars(select(Job).where(Job.idempotency_key == key))).one()
             if job.request_fingerprint != fingerprint:
                 raise IdempotencyConflict
     return SubmissionResult(job=job, created=created)

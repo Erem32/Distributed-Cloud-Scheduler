@@ -3,11 +3,11 @@
 A portfolio backend project focused on explainable distributed job execution,
 PostgreSQL transactions, delivery semantics and failure recovery. Development is
 local-first and follows validated milestones. The local foundation contains a
-FastAPI API, persisted jobs with optional submission idempotency, atomic local execution,
-durable dispatch obligations,
+FastAPI API, persisted jobs with optional submission idempotency, atomic execution,
+bounded execution retries, attempt history and durable dispatch obligations,
 PostgreSQL connectivity, explicit Alembic migrations, container setup and a
 Pub/Sub publisher/push worker validated with the local emulator. Cloud deployment
-and automatic execution retries are planned work; see the
+is planned work; see the
 [living plan](docs/PLAN.md).
 
 ## Current architecture
@@ -37,6 +37,8 @@ and Pub/Sub push both use the same execution ownership rules. The push worker
 runs separately from the submission API so Cloud Run service IAM can protect it.
 Revision 0005 adds nullable submission keys/fingerprints and their database constraints;
 existing jobs retain their identities and execution/dispatch state.
+Revision 0006 adds durable retry timing and execution attempt history. Existing
+terminal jobs remain terminal; only known active ownership is backfilled.
 
 The target cloud stack is GCP Pub/Sub, Cloud Run and Cloud SQL, added after local
 execution and concurrency have been proved. See the
@@ -106,6 +108,7 @@ and deployment follow later milestones.
 | --- | --- |
 | `POST /jobs` | `201` with a new job/outbox; matching `Idempotency-Key` replay returns current job with `200`, different content returns `409` |
 | `GET /jobs/{job_id}` | Persisted job or `404`; invalid UUID returns `422` |
+| `GET /jobs/{job_id}/attempts` | Up to 20 known attempts in execution order; ownership tokens stay internal |
 | `GET /jobs` | `{items, limit, offset}`; newest first with a UUID tie-breaker |
 | `GET /health` | `200 {"status":"ok"}` without querying dependencies |
 | `GET /ready` | `200 {"status":"ready"}` after a query; otherwise sanitized `503 {"status":"not_ready"}` |
@@ -126,11 +129,11 @@ python -m distributed_cloud_scheduler.worker --once
 docker compose run --rm api python -m distributed_cloud_scheduler.worker --once
 ```
 
-`--once` claims at most one PENDING or QUEUED job, regardless of configured concurrency.
+`--once` claims at most one PENDING, QUEUED or due RETRY_WAIT job, regardless of concurrency.
 Without it the worker polls continuously with `WORKER_CONCURRENCY` independent
 execution slots (default 1, maximum 20).
-Inspect the job again to see `SUCCEEDED` with `result_metadata`, or `FAILED` with
-classified `error_info`. Handler payload validation happens during execution;
+Inspect the job again to see `SUCCEEDED` with `result_metadata`, or RETRY_WAIT/FAILED
+with classified `error_info`. Handler payload validation happens during execution;
 the submission API accepts a generic validated JSON object.
 
 | Task type | Payload and result |
@@ -140,8 +143,9 @@ the submission API accepts a generic validated JSON object.
 | `controlled_failure` | `{"fail_until_attempt":1}` fails on attempt 1; 0 through 20; use 0 for immediate success |
 
 Unknown types and invalid handler payloads become permanent classified failures.
-Controlled failures and timeouts are classified retryable, but automatic retries
-are not yet implemented. Every task error currently ends the job as FAILED.
+Controlled failures and timeouts schedule automatic retries while budget remains;
+permanent failures or exhaustion finish as FAILED. `--once` processes one attempt;
+run continuously to execute a retry after its due time.
 
 Task identifiers start with a lowercase ASCII letter, followed by lowercase
 letters, digits or underscores, up to 64 characters. Payloads must be JSON objects
@@ -231,14 +235,16 @@ Swagger exposes the optional header and the 200/201/409 responses. See
 
 ## Local execution semantics
 
-Workers select PENDING or QUEUED rows in short `FOR UPDATE SKIP LOCKED` transactions,
-commit a RUNNING claim with a token/lease and increment the attempt count, then
-execute outside the transaction. Completion locks the row and rechecks the token
-and current database time, preventing a stale owner from committing an outcome.
+Workers select PENDING, QUEUED or due RETRY_WAIT rows in short
+`FOR UPDATE SKIP LOCKED` transactions, commit a RUNNING claim with a token/lease,
+increment the attempt count and insert its history record, then execute outside
+the transaction. Completion locks the job and rechecks its token, attempt number
+and current database time. It checks lease validity again after outcome/history/
+outbox writes, rolling everything back if a lock wait outlived ownership.
 Claim tokens stay internal; the API returns outcome metadata and UTC timestamps.
 
-Polling workers recover expired owners to FAILED with `worker_lost`. Recovery
-requires a worker to poll; it does not re-execute failed jobs yet. Worker loops
+Polling workers recover expired owners as `worker_lost`, scheduling a retry if
+budget remains. Recovery requires a worker poll or delivery of that ID. Worker loops
 share an engine, with independent operation sessions. The concurrency limit is
 per process; multiple processes coordinate through database claims. Size process
 counts and connection pools together for deployment.
@@ -255,6 +261,47 @@ Current task deadlines fit inside leases with a safety margin, so periodic renew
 is deferred. Database ownership does not establish exactly-once external side
 effects; current handlers have no external side effects.
 
+## Execution retries and history
+
+PostgreSQL controls execution attempts. The default `max_attempts` is 3, including
+the initial attempt, with a maximum of 20. Broker deliveries and publication
+attempts do not consume this budget. Controlled failures, handler timeouts,
+unexpected internal errors, cancellation and worker loss are retryable. Invalid
+handler payloads and unknown task types are permanent. Permanent failures and
+retryable failures at the limit become terminal FAILED; manual retry and
+dead-letter handling are planned for the next milestone.
+
+A retryable failure with budget remaining atomically finalizes its attempt,
+changes the job to RETRY_WAIT, persists `next_attempt_at` and inserts a new outbox
+obligation available at that same time. `error_info` describes the latest failed
+attempt. `finished_at` is that attempt's finish time, even while waiting; claiming
+the next attempt clears both fields and `next_attempt_at`. Every attempt retains
+its own outcome and chosen next retry time in history.
+
+Backoff uses capped exponential equal jitter. After attempt n, the cap is
+`min(EXECUTION_RETRY_BASE_SECONDS * 2^(n-1), EXECUTION_RETRY_MAX_SECONDS)` and the
+delay is between half the cap and the cap. Defaults are 1/60 seconds; both settings
+accept 0.001 through 300 seconds and maximum must be at least base. The due time
+comes from the database clock and is chosen once. Restart, replay and early old
+messages cannot move it or execute early. Publication leaves RETRY_WAIT intact;
+only a due execution claim removes it.
+
+Run the dispatcher for Pub/Sub retries to progress. Polling workers can claim
+due retries directly; their later unused outbox obligations are skipped after
+the job finishes. Push acknowledges committed retry intent because the outbox
+retains the next dispatch. A lost response can cause another delivery, which
+shares the same due gating and ownership rules.
+
+`GET /jobs/{job_id}/attempts` returns an ordered JSON list with attempt number,
+status, start/finish times, outcome metadata and retry time, without claim tokens
+or task payloads. No attempts returns `[]`; an unknown job returns 404. History is
+complete for claims admitted after migration 0006. Earlier completed history is
+unavailable, and only known active RUNNING ownership is backfilled. Upgrading
+does not revive existing FAILED jobs. Coordinate runtime upgrades because older
+workers cannot interpret RETRY_WAIT. Downgrading 0006 stops waiting retries as
+FAILED and removes retry timing/history, while retaining other job data and all
+outbox records. See [D012](docs/DECISIONS.md) for retry authority and acknowledgement.
+
 ## Durable dispatch boundary
 
 Job creation commits both the job and a READY `dispatch_outbox` row in one
@@ -262,7 +309,7 @@ transaction. If either insert fails, neither persists. `dispatch_once` leases on
 due obligation, calls an async `Publisher.publish(job_id)` outside the transaction,
 then records PUBLISHED using the current token and an unexpired lease. Transport
 acceptance is separate from job success. The job becomes QUEUED only if still
-PENDING; publication never replaces RUNNING or a terminal execution state.
+PENDING; publication never replaces RUNNING, RETRY_WAIT or a terminal execution state.
 
 Failed publication keeps the obligation READY with a sanitized error code and
 exponential backoff capped by `DISPATCH_RETRY_MAX_SECONDS`. Interrupted publishers
@@ -293,8 +340,8 @@ Cancellation/timeout can leave ambiguous broker acceptance and later replay.
 The durable outbox relies on a dispatcher being invoked; it cannot publish by
 itself. Publication retries do not re-execute FAILED jobs. Local delivery and
 publication failure/replay remain covered in [delivery tests](tests/integration/test_delivery.py)
-and [dispatcher tests](tests/integration/test_dispatcher.py). Execution retry and
-outbox retention policy follow later milestones.
+and [dispatcher tests](tests/integration/test_dispatcher.py). Execution retries add
+new delayed obligations; outbox retention and cleanup remain planned work.
 
 ## Pub/Sub push worker
 
@@ -314,7 +361,8 @@ it cannot supply task data or execution attempts. Unwrapped delivery is unsuppor
 | Delivery condition | HTTP result |
 | --- | --- |
 | Committed success or classified failure; terminal duplicate | 204 ACK |
-| Expired target owner recovered to FAILED/worker_lost | 204 ACK |
+| Committed RETRY_WAIT with replacement outbox; early retry duplicate | 204 ACK |
+| Expired target owner recovered to RETRY_WAIT or exhausted FAILED | 204 ACK |
 | Active ownership, row contention, full capacity or rejected completion | 503, redeliver |
 | Database failure or total request timeout | 503, redeliver |
 | Unknown job ID | 404, redeliver |
@@ -322,8 +370,9 @@ it cannot supply task data or execution attempts. Unwrapped delivery is unsuppor
 
 Pub/Sub retries all these non-success responses. Unknown or malformed messages
 may therefore repeat indefinitely before a future dead-letter policy is configured.
-A FAILED job is currently terminal even if its error is classified retryable;
-broker delivery count does not consume or control execution attempts.
+A FAILED job is terminal; retryable failures with budget remaining use RETRY_WAIT.
+Broker delivery count does not consume or control execution attempts. A due
+RETRY_WAIT row locked by another claimant returns 503 until ownership is committed.
 
 The worker reserves at most `WORKER_CONCURRENCY` request slots per process and
 executes within the HTTP request. It uses the same handler deadline, database
@@ -358,8 +407,10 @@ The smoke creates a random schema, topic and push subscription, starts live API
 and push worker processes on free ports, and exercises the real dispatcher CLI/Google SDK.
 It verifies keyed create/replay/conflict and current-state replay after execution,
 nested object/default matching, independent no-key submissions, persisted results,
-success/failure duplicate ACKs, malformed/unknown/oversized
-requests, and durable publication recovery after a broker connection failure.
+success/failure duplicate ACKs, transient retry/backoff with an early duplicate,
+success on attempt 2, bounded exhaustion, permanent failure, ordered attempt history,
+malformed/unknown/oversized requests, and durable publication recovery after a
+broker connection failure.
 It removes its resources and fails when prerequisites or checks fail.
 `--push-host` must be reachable from the emulator; Docker Desktop uses
 `host.docker.internal` to reach the host worker. The default `127.0.0.1` suits
@@ -414,6 +465,10 @@ Submission tests cover matching/conflicting requests across independent API engi
 actual uniqueness lock waits followed by commit/rollback/cancellation, atomic
 job/outbox rollback, and unchanged current-state replay after execution. Migration
 tests preserve existing rows across the nullable idempotency metadata change.
+Retry tests cover persisted due times, competing due claims, atomic history/outbox
+rollback, exhaustion/permanent classification, crash recovery, stale completions
+and current keyed replay across retries. Migration tests preserve historical state
+and explicitly validate the downgrade behavior for waiting retries.
 
 ## Engineering documents
 

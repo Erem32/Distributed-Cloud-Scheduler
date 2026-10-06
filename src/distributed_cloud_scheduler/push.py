@@ -7,12 +7,14 @@ import binascii
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from distributed_cloud_scheduler.__main__ import create_event_loop
@@ -82,6 +84,12 @@ async def _unclaimed_response(database: Database, job_id: UUID) -> Response:
             raise HTTPException(status_code=404, detail="Job not found")
         if job.status in TERMINAL_STATUSES:
             return Response(status_code=204)
+        if job.status is JobStatus.RETRY_WAIT:
+            now = cast(datetime, await session.scalar(select(func.clock_timestamp())))
+            if job.next_attempt_at is not None and job.next_attempt_at > now:
+                return Response(status_code=204)
+            # A due claim may be locked by an uncommitted owner. Preserve redelivery
+            # until it commits rather than ACKing the last available due delivery.
     raise HTTPException(status_code=503, detail="Job is not available for execution")
 
 
@@ -179,7 +187,7 @@ def create_push_app(
         },
     )
     async def deliver(request: Request) -> Response:
-        """Execute within the request; acknowledge only a persisted terminal outcome."""
+        """Acknowledge committed outcomes or retry intent; execute only eligible work."""
         nonlocal active_requests
         # No await separates this check and reservation on the application's event loop.
         if active_requests >= configured.worker_concurrency:
@@ -189,7 +197,11 @@ def create_push_app(
             async with asyncio.timeout(transport.push_request_timeout_seconds):
                 job_id = await _read_job_id(request, subscription)
                 database = cast(Database, app.state.database)
-                await recover_expired(database, job_id=job_id)
+                await recover_expired(
+                    database,
+                    job_id=job_id,
+                    retry_policy=configured.execution_retry_policy,
+                )
                 claim = await claim_job(database, job_id, configured.worker_lease_seconds)
                 if claim is None:
                     return await _unclaimed_response(database, job_id)

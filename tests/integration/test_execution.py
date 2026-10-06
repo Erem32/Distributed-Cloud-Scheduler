@@ -17,6 +17,9 @@ from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.execution import claim_pending, complete_claim, recover_expired
 from distributed_cloud_scheduler.jobs import Job, JobCreate, JobStatus, create_job
+from distributed_cloud_scheduler.retries import RetryPolicy
+
+LONG_RETRY = RetryPolicy(base_seconds=60, max_seconds=60)
 
 
 @pytest_asyncio.fixture
@@ -30,10 +33,13 @@ async def execution_database(integration_database_url: str) -> AsyncIterator[Dat
         await database.dispose()
 
 
-async def submit(database: Database) -> UUID:
+async def submit(database: Database, *, max_attempts: int = 3) -> UUID:
     async with database.session_factory() as session:
         job = await create_job(
-            session, JobCreate(type="calculation", payload={"numbers": [1, 2, 3]})
+            session,
+            JobCreate(
+                type="calculation", payload={"numbers": [1, 2, 3]}, max_attempts=max_attempts
+            ),
         )
         return job.id
 
@@ -139,10 +145,10 @@ async def test_completion_for_unknown_job_is_rejected(execution_database: Databa
 
 
 @pytest.mark.asyncio
-async def test_failure_is_persisted_without_automatic_reexecution(
+async def test_failure_at_attempt_budget_is_terminal_without_reexecution(
     execution_database: Database,
 ) -> None:
-    job_id = await submit(execution_database)
+    job_id = await submit(execution_database, max_attempts=1)
     claim = await claim_pending(execution_database, lease_seconds=60)
     assert claim is not None
     error = {"code": "controlled_failure", "retryable": True}
@@ -175,14 +181,15 @@ async def test_expired_completion_is_fenced_before_and_after_recovery(
     assert expired.result_metadata is None
     assert expired.error_info is None
 
-    assert await recover_expired(execution_database) == 1
+    assert await recover_expired(execution_database, retry_policy=LONG_RETRY) == 1
     assert not await complete_claim(execution_database, claim, result={"sum": 6})
     recovered = await read_job(execution_database, job_id)
-    assert recovered.status is JobStatus.FAILED
+    assert recovered.status is JobStatus.RETRY_WAIT
     assert recovered.error_info
     assert recovered.result_metadata is None
     assert recovered.attempt_count == 1
     assert recovered.finished_at is not None
+    assert recovered.next_attempt_at is not None
     assert recovered.claim_token is None
     assert recovered.lease_expires_at is None
     assert await recover_expired(execution_database) == 0
@@ -263,15 +270,16 @@ async def test_recovery_uses_bounded_batches_and_preserves_attempt_counts(
         claim = await claim_pending(execution_database, lease_seconds=60)
         assert claim is not None
         await expire_claim(execution_database, claim.id)
-    assert await recover_expired(execution_database, limit=2) == 2
+    assert await recover_expired(execution_database, limit=2, retry_policy=LONG_RETRY) == 2
     statuses = [(await read_job(execution_database, job_id)).status for job_id in job_ids]
-    assert statuses.count(JobStatus.FAILED) == 2
+    assert statuses.count(JobStatus.RETRY_WAIT) == 2
     assert statuses.count(JobStatus.RUNNING) == 1
-    assert await recover_expired(execution_database, limit=2) == 1
+    assert await recover_expired(execution_database, limit=2, retry_policy=LONG_RETRY) == 1
     assert await recover_expired(execution_database, limit=2) == 0
     for job_id in job_ids:
         job = await read_job(execution_database, job_id)
-        assert job.status is JobStatus.FAILED
+        assert job.status is JobStatus.RETRY_WAIT
+        assert job.next_attempt_at is not None
         assert job.attempt_count == 1
         assert job.claim_token is None
         assert job.lease_expires_at is None

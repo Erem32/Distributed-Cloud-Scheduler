@@ -27,7 +27,12 @@ def worker_settings(integration_database_url: str) -> Settings:
     url = make_url(integration_database_url).update_query_dict(
         {"application_name": f"worker_test_{uuid4().hex}"}
     )
-    return Settings(database_url=url.render_as_string(hide_password=False), _env_file=None)
+    return Settings(
+        database_url=url.render_as_string(hide_password=False),
+        execution_retry_base_seconds=60,
+        execution_retry_max_seconds=60,
+        _env_file=None,
+    )
 
 
 @pytest_asyncio.fixture
@@ -73,7 +78,9 @@ async def test_api_submission_local_execution_and_result_inspection(
     app = create_app(worker_settings)
     async with app.router.lifespan_context(app):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post("/jobs", json={"type": job_type, "payload": payload})
+            response = await client.post(
+                "/jobs", json={"type": job_type, "payload": payload, "max_attempts": 1}
+            )
             assert response.status_code == 201
             job_id = response.json()["id"]
             assert response.json()["status"] == "PENDING"
@@ -88,12 +95,12 @@ async def test_api_submission_local_execution_and_result_inspection(
             assert job["finished_at"] is not None
             assert "claim_token" not in job
             assert "lease_expires_at" not in job
-            # Failure classification does not start retries before their own milestone.
+            # A one-attempt budget keeps every failure terminal.
             assert await worker.run_once(worker_database, worker_settings) is False
 
 
 @pytest.mark.asyncio
-async def test_task_timeout_is_persisted_without_retrying(
+async def test_task_timeout_is_persisted_with_a_durable_retry(
     worker_database: Database, worker_settings: Settings
 ) -> None:
     job_id = await submit_job(worker_database, "sleep", {"seconds": 1})
@@ -102,7 +109,8 @@ async def test_task_timeout_is_persisted_without_retrying(
     async with worker_database.session_factory() as session:
         job = await get_job(session, job_id)
         assert job is not None
-        assert job.status == "FAILED"
+        assert job.status == "RETRY_WAIT"
+        assert job.next_attempt_at is not None
         assert job.error_info == {"code": "task_timeout", "retryable": True}
         assert job.result_metadata is None
     assert await worker.run_once(worker_database, settings) is False
@@ -127,7 +135,8 @@ async def test_unexpected_handler_exception_is_classified_without_exposing_text(
     async with worker_database.session_factory() as session:
         job = await get_job(session, job_id)
         assert job is not None
-        assert job.status == "FAILED"
+        assert job.status == "RETRY_WAIT"
+        assert job.next_attempt_at is not None
         assert job.error_info == {"code": "internal_error", "retryable": True}
         assert "secret_payload_marker" not in str(job.error_info)
 
@@ -218,13 +227,14 @@ async def test_stale_execution_cannot_overwrite_recovered_owner(
     async with worker_database.session_factory() as session:
         job = await get_job(session, job_id)
         assert job is not None
-        assert job.status == "FAILED"
+        assert job.status == "RETRY_WAIT"
+        assert job.next_attempt_at is not None
         assert job.error_info == {"code": "worker_lost", "retryable": True}
         assert job.result_metadata is None
 
 
 @pytest.mark.asyncio
-async def test_cancellation_marks_matching_owner_failed_and_propagates(
+async def test_cancellation_schedules_matching_owner_for_retry_and_propagates(
     worker_database: Database,
     worker_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -249,6 +259,7 @@ async def test_cancellation_marks_matching_owner_failed_and_propagates(
     async with worker_database.session_factory() as session:
         job = await get_job(session, job_id)
         assert job is not None
-        assert job.status == "FAILED"
+        assert job.status == "RETRY_WAIT"
+        assert job.next_attempt_at is not None
         assert job.error_info == {"code": "cancelled", "retryable": True}
         assert job.result_metadata is None

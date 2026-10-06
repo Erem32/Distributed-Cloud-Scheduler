@@ -14,6 +14,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from distributed_cloud_scheduler.attempts import AttemptRead, list_attempts
 from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.idempotency import (
@@ -160,5 +161,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JobList(
             items=[JobRead.model_validate(job) for job in jobs], limit=limit, offset=offset
         )
+
+    @app.get(
+        "/jobs/{job_id}/attempts",
+        response_model=list[AttemptRead],
+        responses={404: {"description": "Job not found."}},
+    )
+    async def read_attempts(
+        job_id: UUID,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> list[AttemptRead]:
+        """Inspect up to 20 known attempts in execution order; legacy history may be absent."""
+        if await get_job(session, job_id) is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return [AttemptRead.model_validate(row) for row in await list_attempts(session, job_id)]
 
     return app

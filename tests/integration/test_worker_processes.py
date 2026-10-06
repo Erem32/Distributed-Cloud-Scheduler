@@ -53,6 +53,8 @@ def start_worker(database: Database) -> subprocess.Popen[str]:
             "WORKER_TASK_TIMEOUT_SECONDS": "15",
             "WORKER_LEASE_SECONDS": "60",
             "WORKER_POLL_INTERVAL_SECONDS": "0.05",
+            "EXECUTION_RETRY_BASE_SECONDS": "60",
+            "EXECUTION_RETRY_MAX_SECONDS": "60",
             "PYTHONUNBUFFERED": "1",
         }
     )
@@ -125,10 +127,10 @@ async def test_independent_once_processes_complete_distinct_jobs_once(
 
 
 @pytest.mark.asyncio
-async def test_forced_process_crash_is_recovered_by_another_process_without_reexecution(
+async def test_forced_process_crash_is_recovered_and_retried_by_independent_processes(
     process_database: Database,
 ) -> None:
-    job_id = await submit(process_database, "sleep", {"seconds": 10})
+    job_id = await submit(process_database, "sleep", {"seconds": 2})
     child = start_worker(process_database)
     try:
         async with asyncio.timeout(10):
@@ -171,10 +173,47 @@ async def test_forced_process_crash_is_recovered_by_another_process_without_reex
         await asyncio.to_thread(stop_process, recovery_worker)
 
     recovered = await read_job(process_database, job_id)
-    assert recovered.status is JobStatus.FAILED
+    assert recovered.status is JobStatus.RETRY_WAIT
+    assert recovered.next_attempt_at is not None
     assert recovered.error_info == {"code": "worker_lost", "retryable": True}
     assert recovered.result_metadata is None
     assert recovered.attempt_count == 1
     assert recovered.finished_at is not None
     assert recovered.claim_token is None
     assert recovered.lease_expires_at is None
+
+    async with process_database.session_factory.begin() as session:
+        # Simulate the retry deadline passing after the recovery process has exited.
+        await session.execute(
+            text("UPDATE jobs SET next_attempt_at = clock_timestamp() WHERE id = :job_id"),
+            {"job_id": job_id},
+        )
+    retry_worker = start_worker(process_database)
+    try:
+        await assert_worker_exits_successfully(retry_worker)
+    finally:
+        await asyncio.to_thread(stop_process, retry_worker)
+    completed = await read_job(process_database, job_id)
+    assert completed.status is JobStatus.SUCCEEDED
+    assert completed.attempt_count == 2
+    assert completed.next_attempt_at is None
+    assert completed.result_metadata == {"slept_seconds": 2}
+    assert completed.error_info is None
+    async with process_database.session_factory() as session:
+        attempts = list(
+            (
+                await session.execute(
+                    text(
+                        "SELECT attempt_number, status, error_info FROM job_attempts "
+                        "WHERE job_id = :job_id ORDER BY attempt_number"
+                    ),
+                    {"job_id": job_id},
+                )
+            ).mappings()
+        )
+    assert [(row["attempt_number"], row["status"]) for row in attempts] == [
+        (1, "FAILED"),
+        (2, "SUCCEEDED"),
+    ]
+    assert attempts[0]["error_info"] == {"code": "worker_lost", "retryable": True}
+    assert attempts[1]["error_info"] is None

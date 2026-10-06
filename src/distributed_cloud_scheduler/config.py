@@ -7,6 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
+from distributed_cloud_scheduler.retries import RetryPolicy
+
 
 class Settings(BaseSettings):
     """Runtime settings read when an application is explicitly created."""
@@ -26,6 +28,8 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: float = Field(default=0.5, gt=0, le=10, allow_inf_nan=False)
     worker_concurrency: int = Field(default=1, ge=1, le=20)
     worker_shutdown_timeout_seconds: float = Field(default=20, gt=0, le=60, allow_inf_nan=False)
+    execution_retry_base_seconds: float = Field(default=1, ge=0.001, le=300, allow_inf_nan=False)
+    execution_retry_max_seconds: float = Field(default=60, ge=0.001, le=300, allow_inf_nan=False)
     dispatch_publish_timeout_seconds: float = Field(default=10, gt=0, le=30, allow_inf_nan=False)
     dispatch_lease_seconds: int = Field(default=30, ge=1, le=300)
     dispatch_retry_base_seconds: float = Field(default=1, gt=0, le=30, allow_inf_nan=False)
@@ -46,7 +50,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DISPATCH_RETRY_MAX_SECONDS must be at least DISPATCH_RETRY_BASE_SECONDS"
             )
+        if self.execution_retry_max_seconds < self.execution_retry_base_seconds:
+            raise ValueError(
+                "EXECUTION_RETRY_MAX_SECONDS must be at least EXECUTION_RETRY_BASE_SECONDS"
+            )
         return self
+
+    @property
+    def execution_retry_policy(self) -> RetryPolicy:
+        """Pass a transport-independent retry policy into execution transactions."""
+        return RetryPolicy(self.execution_retry_base_seconds, self.execution_retry_max_seconds)
 
     @field_validator("database_url")
     @classmethod

@@ -43,12 +43,21 @@ async def execute_claim(database: Database, claim: Claim, settings: Settings) ->
         except Exception:
             # An unexpected handler error must not expose its text or submitted data.
             error = {"code": "internal_error", "retryable": True}
-        return await complete_claim(database, claim, result=result, error=error)
+        return await complete_claim(
+            database,
+            claim,
+            result=result,
+            error=error,
+            retry_policy=settings.execution_retry_policy,
+        )
     except asyncio.CancelledError:
         try:
             async with asyncio.timeout(settings.database_connect_timeout_seconds + 1):
                 await complete_claim(
-                    database, claim, error={"code": "cancelled", "retryable": True}
+                    database,
+                    claim,
+                    error={"code": "cancelled", "retryable": True},
+                    retry_policy=settings.execution_retry_policy,
                 )
         except (SQLAlchemyError, OSError, TimeoutError, asyncio.CancelledError):
             # If cleanup cannot reach PostgreSQL, lease recovery handles the lost owner.
@@ -62,7 +71,7 @@ async def run_once(
     """Inspect expired ownership and process at most one pending job."""
     if stop_event is not None and stop_event.is_set():
         return False
-    await recover_expired(database)
+    await recover_expired(database, retry_policy=settings.execution_retry_policy)
     if stop_event is not None and stop_event.is_set():
         return False
     claim = await claim_pending(database, lease_seconds=settings.worker_lease_seconds)

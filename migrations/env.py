@@ -6,7 +6,11 @@ from alembic import context
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
-from distributed_cloud_scheduler import jobs, outbox  # noqa: F401 -- register all model metadata
+from distributed_cloud_scheduler import (
+    attempts,  # noqa: F401 -- register all model metadata
+    jobs,
+    outbox,  # noqa: F401 -- register all model metadata
+)
 from distributed_cloud_scheduler.config import Settings
 
 config = context.config

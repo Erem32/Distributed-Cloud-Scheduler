@@ -43,6 +43,8 @@ def settings_for(database: Database, **overrides: object) -> Settings:
     return Settings(
         database_url=database.engine.url.render_as_string(hide_password=False),
         worker_concurrency=overrides.pop("worker_concurrency", 3),
+        execution_retry_base_seconds=overrides.pop("execution_retry_base_seconds", 60),
+        execution_retry_max_seconds=overrides.pop("execution_retry_max_seconds", 60),
         _env_file=None,
         **overrides,
     )
@@ -76,12 +78,16 @@ async def submit(
     database: Database,
     job_type: str = "calculation",
     payload: dict[str, JsonValue] | None = None,
+    *,
+    max_attempts: int = 3,
 ) -> UUID:
     async with database.session_factory() as session:
         job = await create_job(
             session,
             JobCreate(
-                type=job_type, payload=payload if payload is not None else {"numbers": [1, 2, 3]}
+                type=job_type,
+                payload=payload if payload is not None else {"numbers": [1, 2, 3]},
+                max_attempts=max_attempts,
             ),
         )
         return job.id
@@ -151,10 +157,12 @@ async def test_api_submission_and_separate_push_app_share_authoritative_state(
 
 
 @pytest.mark.asyncio
-async def test_persisted_task_failure_acknowledges_without_execution_retry(
+async def test_exhausted_task_failure_acknowledges_without_execution_retry(
     push_database: Database, push_client: AsyncClient
 ) -> None:
-    job_id = await submit(push_database, "controlled_failure", {"fail_until_attempt": 3})
+    job_id = await submit(
+        push_database, "controlled_failure", {"fail_until_attempt": 3}, max_attempts=1
+    )
     assert (await push_client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
     failed = await read_job(push_database, job_id)
     assert failed.status is JobStatus.FAILED
@@ -242,7 +250,7 @@ async def test_duplicate_across_independent_push_engines_and_restart_preserves_o
         return await execute_task(task_type, task_payload, attempt)
 
     monkeypatch.setattr(worker, "execute_task", held_handler)
-    job_id = await submit(push_database, job_type, payload)
+    job_id = await submit(push_database, job_type, payload, max_attempts=1)
     owner_app = create_push_app(
         settings_for(push_database, worker_concurrency=1), transport_settings()
     )
@@ -429,7 +437,8 @@ async def test_target_expired_recovery_preserves_other_owners_and_fences_stale_r
     await expire(push_database, other_id)
     assert (await push_client.post("/pubsub/push", json=envelope(first_id))).status_code == 204
     failed = await read_job(push_database, first_id)
-    assert failed.status is JobStatus.FAILED
+    assert failed.status is JobStatus.RETRY_WAIT
+    assert failed.next_attempt_at is not None
     assert failed.error_info == {"code": "worker_lost", "retryable": True}
     assert failed.attempt_count == 1
     assert (await read_job(push_database, other_id)).status is JobStatus.RUNNING
@@ -455,7 +464,8 @@ async def test_fenced_completion_nacks_without_overwriting_recovered_outcome(
     assert response.status_code == 503
     assert response.json() == {"detail": "Execution ownership lost"}
     failed = await read_job(push_database, job_id)
-    assert failed.status is JobStatus.FAILED
+    assert failed.status is JobStatus.RETRY_WAIT
+    assert failed.next_attempt_at is not None
     assert failed.result_metadata is None
     assert failed.error_info == {"code": "worker_lost", "retryable": True}
     assert (await push_client.post("/pubsub/push", json=envelope(job_id))).status_code == 204
@@ -509,7 +519,8 @@ async def test_request_cancellation_persists_failure_and_releases_admission(
             with pytest.raises(asyncio.CancelledError):
                 await running
             cancelled = await read_job(push_database, job_id)
-            assert cancelled.status is JobStatus.FAILED
+            assert cancelled.status is JobStatus.RETRY_WAIT
+            assert cancelled.next_attempt_at is not None
             assert cancelled.error_info == {"code": "cancelled", "retryable": True}
             monkeypatch.setattr(worker, "execute_task", execute_task)
             next_id = await submit(push_database)
@@ -541,7 +552,8 @@ async def test_total_request_timeout_cancels_execution_before_acknowledgement(
             assert response.status_code == 503
             assert response.json() == {"detail": "Push request timed out"}
             cancelled = await read_job(push_database, job_id)
-            assert cancelled.status is JobStatus.FAILED
+            assert cancelled.status is JobStatus.RETRY_WAIT
+            assert cancelled.next_attempt_at is not None
             assert cancelled.error_info == {"code": "cancelled", "retryable": True}
             transport.push_request_timeout_seconds = 45
             assert (await client.post("/pubsub/push", json=envelope(job_id))).status_code == 204

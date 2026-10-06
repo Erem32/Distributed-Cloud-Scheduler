@@ -1,4 +1,4 @@
-"""Exercise live API idempotency, SDK publication and emulator push on Windows or Linux.
+"""Exercise live API identity, durable retries and emulator push on Windows or Linux.
 
 Set TEST_DATABASE_URL to a separate database ending in _test and explicitly set
 PUBSUB_EMULATOR_HOST. Start the optional compose.pubsub.yaml emulator first. When
@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -128,6 +129,23 @@ async def public_job(api_url: str, job_id: UUID) -> dict:
     return json.loads(body)
 
 
+async def public_attempts(api_url: str, job_id: UUID) -> list[dict]:
+    status, body = await asyncio.to_thread(request, f"{api_url}/jobs/{job_id}/attempts")
+    require(status == 200, "Live API could not read execution attempt history")
+    history = json.loads(body)
+    require(isinstance(history, list), "Attempt history was not a plain ordered list")
+    require(
+        all(
+            isinstance(attempt, dict)
+            and not {"claim_token", "owner_token", "idempotency_key", "request_fingerprint"}
+            .intersection(attempt)
+            for attempt in history
+        ),
+        "Attempt history exposed internal ownership or submission metadata",
+    )
+    return history
+
+
 async def require_keyed_rows(database: Database, key: str, job_id: UUID) -> None:
     async with database.session_factory() as session:
         job_count = await session.scalar(
@@ -161,9 +179,40 @@ async def read_outbox(database: Database, job_id: UUID) -> DispatchOutbox:
         return row
 
 
-async def submit(database: Database, job_type: str, payload: dict) -> UUID:
+async def read_outbox_rows(database: Database, job_id: UUID) -> list[DispatchOutbox]:
     async with database.session_factory() as session:
-        job = await create_job(session, JobCreate(type=job_type, payload=payload))
+        rows = await session.scalars(
+            select(DispatchOutbox)
+            .where(DispatchOutbox.job_id == job_id)
+            .order_by(DispatchOutbox.created_at, DispatchOutbox.id)
+        )
+        return list(rows)
+
+
+async def before_due(database: Database, due: datetime) -> bool:
+    """Compare with PostgreSQL's clock rather than the host's wall clock."""
+    async with database.session_factory() as session:
+        return bool(await session.scalar(select(func.clock_timestamp() < due)))
+
+
+async def dispatch_when_due(
+    database: Database, publisher: PubSubPublisher, settings: Settings, due: datetime
+) -> None:
+    async with asyncio.timeout(20):
+        while await before_due(database, due):
+            await asyncio.sleep(0.05)
+    require(
+        await dispatch_once(database, publisher, settings), "Due execution retry was not published"
+    )
+
+
+async def submit(
+    database: Database, job_type: str, payload: dict, *, max_attempts: int = 3
+) -> UUID:
+    async with database.session_factory() as session:
+        job = await create_job(
+            session, JobCreate(type=job_type, payload=payload, max_attempts=max_attempts)
+        )
         return job.id
 
 
@@ -178,6 +227,173 @@ async def wait_for_outcome(database: Database, job_id: UUID, status: JobStatus) 
                 "Job reached an unexpected terminal outcome",
             )
             await asyncio.sleep(0.05)
+
+
+async def exercise_execution_retries(
+    database: Database,
+    publisher: PubSubPublisher,
+    settings: Settings,
+    api_url: str,
+    log_path: Path,
+) -> None:
+    """Prove database-owned attempts through the real API, SDK and push adapter."""
+    transient_submission = {
+        "type": "controlled_failure",
+        "payload": {"fail_until_attempt": 1},
+        "max_attempts": 3,
+    }
+    transient_key = f"smoke-transient:{uuid4().hex}"
+    status, created = await api_submission(api_url, transient_submission, transient_key)
+    require(status == 201, "Live API did not accept the transient retry job")
+    transient_id = UUID(created["id"])
+    acknowledgements = acknowledged_pushes(log_path)
+    require(await dispatch_once(database, publisher, settings), "Transient job was not dispatched")
+    waiting = await wait_for_outcome(database, transient_id, JobStatus.RETRY_WAIT)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    require(
+        waiting.attempt_count == 1
+        and waiting.next_attempt_at is not None
+        and waiting.error_info is not None
+        and waiting.error_info.get("code") == "controlled_failure",
+        "Transient failure did not persist one attempt and its retry due time before ACK",
+    )
+    assert waiting.next_attempt_at is not None
+    due = waiting.next_attempt_at
+    rows = await read_outbox_rows(database, transient_id)
+    require(
+        len(rows) == 2
+        and rows[0].status is DispatchStatus.PUBLISHED
+        and rows[1].status is DispatchStatus.READY
+        and rows[1].available_at == due
+        and rows[1].publish_attempt_count == 0,
+        "Retry outcome did not atomically create its unpublished due-time obligation",
+    )
+    history = await public_attempts(api_url, transient_id)
+    require(
+        len(history) == 1
+        and history[0].get("attempt_number") == 1
+        and history[0].get("status") == "FAILED"
+        and history[0].get("finished_at") is not None
+        and history[0].get("next_attempt_at") is not None,
+        "Transient outcome did not expose its finalized retry attempt",
+    )
+    require(await before_due(database, due), "Positive retry delay elapsed before its gate check")
+    require(
+        not await dispatch_once(database, publisher, settings),
+        "Dispatcher published an execution retry before its database due time",
+    )
+    acknowledgements = acknowledged_pushes(log_path)
+    await publisher.publish(transient_id)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    unchanged = await read_job(database, transient_id)
+    require(
+        unchanged.status is JobStatus.RETRY_WAIT
+        and unchanged.attempt_count == 1
+        and unchanged.next_attempt_at == due
+        and await public_attempts(api_url, transient_id) == history
+        and [row.id for row in await read_outbox_rows(database, transient_id)]
+        == [row.id for row in rows],
+        "An early broker duplicate consumed an attempt or changed the persisted retry",
+    )
+    acknowledgements = acknowledged_pushes(log_path)
+    await dispatch_when_due(database, publisher, settings, due)
+    completed = await wait_for_outcome(database, transient_id, JobStatus.SUCCEEDED)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    rows = await read_outbox_rows(database, transient_id)
+    history = await public_attempts(api_url, transient_id)
+    require(
+        completed.attempt_count == 2
+        and completed.result_metadata == {"attempt": 2}
+        and completed.next_attempt_at is None
+        and len(rows) == 2
+        and all(
+            row.status is DispatchStatus.PUBLISHED and row.publish_attempt_count == 1
+            for row in rows
+        )
+        and [attempt.get("attempt_number") for attempt in history] == [1, 2]
+        and [attempt.get("status") for attempt in history] == ["FAILED", "SUCCEEDED"],
+        "Due retry did not succeed with exactly two ordered attempts and publications",
+    )
+    terminal = await public_job(api_url, transient_id)
+    status, replayed = await api_submission(api_url, transient_submission, transient_key)
+    require(
+        status == 200 and replayed == terminal,
+        "Submission identity did not retain the current retried job",
+    )
+    print(
+        "PASS: transient failure -> durable RETRY_WAIT/ACK; early duplicate and due gate; "
+        "second attempt succeeds with ordered public history",
+        flush=True,
+    )
+
+    exhaustion_submission = {
+        "type": "controlled_failure",
+        "payload": {"fail_until_attempt": 20},
+        "max_attempts": 2,
+    }
+    status, created = await api_submission(api_url, exhaustion_submission)
+    require(status == 201, "Live API did not accept the bounded failure job")
+    exhausted_id = UUID(created["id"])
+    acknowledgements = acknowledged_pushes(log_path)
+    require(await dispatch_once(database, publisher, settings), "Exhaustion job was not dispatched")
+    waiting = await wait_for_outcome(database, exhausted_id, JobStatus.RETRY_WAIT)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    require(waiting.next_attempt_at is not None, "First exhausted-job failure omitted its due time")
+    assert waiting.next_attempt_at is not None
+    acknowledgements = acknowledged_pushes(log_path)
+    await dispatch_when_due(database, publisher, settings, waiting.next_attempt_at)
+    exhausted = await wait_for_outcome(database, exhausted_id, JobStatus.FAILED)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    rows = await read_outbox_rows(database, exhausted_id)
+    history = await public_attempts(api_url, exhausted_id)
+    require(
+        exhausted.attempt_count == 2
+        and exhausted.next_attempt_at is None
+        and exhausted.error_info is not None
+        and exhausted.error_info.get("code") == "controlled_failure"
+        and len(rows) == 2
+        and all(row.status is DispatchStatus.PUBLISHED for row in rows)
+        and [attempt.get("attempt_number") for attempt in history] == [1, 2]
+        and all(attempt.get("status") == "FAILED" for attempt in history),
+        "Execution retry budget did not end at two finalized failed attempts",
+    )
+    acknowledgements = acknowledged_pushes(log_path)
+    await publisher.publish(exhausted_id)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    require(
+        (await read_job(database, exhausted_id)).attempt_count == 2
+        and await public_attempts(api_url, exhausted_id) == history
+        and len(await read_outbox_rows(database, exhausted_id)) == 2,
+        "An exhausted-job broker duplicate extended the attempt budget",
+    )
+    print(
+        "PASS: retry exhaustion is terminal at max_attempts and duplicate ACK is stable", flush=True
+    )
+
+    status, created = await api_submission(api_url, {"type": "unknown_task_probe", "payload": {}})
+    require(status == 201, "Live API did not accept the permanent failure probe")
+    permanent_id = UUID(created["id"])
+    acknowledgements = acknowledged_pushes(log_path)
+    require(
+        await dispatch_once(database, publisher, settings), "Permanent failure was not dispatched"
+    )
+    permanent = await wait_for_outcome(database, permanent_id, JobStatus.FAILED)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    rows = await read_outbox_rows(database, permanent_id)
+    history = await public_attempts(api_url, permanent_id)
+    require(
+        permanent.attempt_count == 1
+        and permanent.next_attempt_at is None
+        and permanent.error_info == {"code": "unknown_task", "retryable": False}
+        and len(rows) == 1
+        and rows[0].status is DispatchStatus.PUBLISHED
+        and len(history) == 1
+        and history[0].get("status") == "FAILED",
+        "Permanent failure scheduled another obligation or consumed another attempt",
+    )
+    print(
+        "PASS: unknown task is a permanent one-attempt failure with no retry obligation", flush=True
+    )
 
 
 async def exercise(
@@ -265,7 +481,9 @@ async def exercise(
             flush=True,
         )
 
-        failed_id = await submit(database, "controlled_failure", {"fail_until_attempt": 1})
+        failed_id = await submit(
+            database, "controlled_failure", {"fail_until_attempt": 1}, max_attempts=1
+        )
         acknowledgements = acknowledged_pushes(log_path)
         require(
             await dispatch_once(database, publisher, settings), "Failure job was not dispatched"
@@ -286,6 +504,8 @@ async def exercise(
             "Broker duplicate retried a terminal task failure",
         )
         print("PASS: terminal task failure and its broker duplicate are ACKed", flush=True)
+
+        await exercise_execution_retries(database, publisher, settings, api_url, log_path)
 
         status, _ = await asyncio.to_thread(
             request, f"{worker_url}/pubsub/push", "POST", b'{"message":{"data":"!"}}'
@@ -456,6 +676,8 @@ def main() -> int:
                 dispatch_publish_timeout_seconds=1,
                 dispatch_retry_base_seconds=0.05,
                 dispatch_retry_max_seconds=1,
+                execution_retry_base_seconds=4,
+                execution_retry_max_seconds=8,
                 _env_file=None,
             )
             environment = os.environ.copy()
@@ -465,6 +687,8 @@ def main() -> int:
                 PUBSUB_SUBSCRIPTION=subscription,
                 PUBSUB_EMULATOR_HOST=emulator_host,
                 DISPATCH_PUBLISH_TIMEOUT_SECONDS="1",
+                EXECUTION_RETRY_BASE_SECONDS="4",
+                EXECUTION_RETRY_MAX_SECONDS="8",
             )
             subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "head"],

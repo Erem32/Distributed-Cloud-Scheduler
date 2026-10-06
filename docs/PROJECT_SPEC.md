@@ -73,7 +73,8 @@ entry points do not imply independent microservice codebases.
 
 The push worker is a separate HTTP application from the submission API. Its
 `POST /pubsub/push` service interface receives wrapped Pub/Sub envelopes containing
-only a base64-encoded canonical job UUID. It acknowledges durable terminal outcomes,
+only a base64-encoded canonical job UUID. It acknowledges durable terminal outcomes
+or retry intent with a replacement outbox obligation,
 and requests redelivery while execution or dependency recovery remains outstanding.
 D010 defines bounded request execution and the initial acknowledgement policy;
 execution retry policy is separate. Production access requires private Cloud Run
@@ -102,13 +103,17 @@ The initial lifecycle proposal is:
 
 ```text
 PENDING -> QUEUED -> RUNNING -> SUCCEEDED
-                       |----> FAILED
+                       |----> RETRY_WAIT -> RUNNING (when due)
+                       |----> FAILED (permanent or exhausted)
                        |----> DEAD_LETTERED
 ```
 
 This is vocabulary, not a complete transition specification. Retry transitions,
 claim recovery, and terminal-state definitions must be specified and tested
 before implementation. Changes to the lifecycle need a decision entry.
+D012 makes application attempts authoritative: each claim and outcome has durable
+history; transient failures commit due retry state and a new outbox obligation.
+Claims use the database due time, independently of broker deliveries.
 
 The eventual public API includes:
 
@@ -116,6 +121,7 @@ The eventual public API includes:
 | --- | --- |
 | `POST /jobs` | Submit a validated job, optionally with `Idempotency-Key` |
 | `GET /jobs/{id}` | Inspect state and useful outcome/attempt information |
+| `GET /jobs/{id}/attempts` | Inspect ordered execution attempt history |
 | `GET /jobs` | List jobs with bounded pagination |
 | `POST /jobs/{id}/retry` | Retry an eligible failed/dead-lettered job |
 | `GET /health` | Process liveness without depending on the database |
@@ -140,7 +146,7 @@ The completed system should make these behaviors explainable and testable:
 - Persisted jobs are not silently stranded by a crash between commit and publish.
 - Crashed/stalled ownership can be recovered without letting an obsolete worker
   commit results as the current owner. Database tokens and leases fence completion;
-  automatic execution retry policy remains a separate design task.
+  application retry state and dispatch obligations must commit atomically (D012).
 - Transient and permanent failures have distinct handling; retries are bounded,
   observable, and coordinated with broker redelivery to avoid retry storms.
 - Exhausted work has an understandable terminal state and appropriate manual

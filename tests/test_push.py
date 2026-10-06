@@ -23,6 +23,7 @@ from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.execution import Claim
 from distributed_cloud_scheduler.pubsub_config import PubSubSettings
+from distributed_cloud_scheduler.retries import RetryPolicy
 
 SUBSCRIPTION = "projects/local-project/subscriptions/jobs-push"
 JOB_ID = UUID("12345678-1234-5678-9abc-123456789abc")
@@ -106,7 +107,7 @@ async def test_validated_id_and_transport_metadata(
     }
     assert (await push_client.post("/pubsub/push", json=body)).status_code == 204
     assert claim.await_args.args[1:] == (JOB_ID, 60)
-    assert recover.await_args.kwargs == {"job_id": JOB_ID}
+    assert recover.await_args.kwargs == {"job_id": JOB_ID, "retry_policy": RetryPolicy()}
 
 
 INVALID_ENVELOPES: list[object] = [

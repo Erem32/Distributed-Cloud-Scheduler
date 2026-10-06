@@ -219,15 +219,16 @@ async def test_shutdown_grace_expiry_cancels_claims_without_admitting_more_work(
 
     assert entered == cancelled == 2
     jobs = await read_jobs(concurrency_database, ids)
-    assert [job.status for job in jobs].count(JobStatus.FAILED) == 2
+    assert [job.status for job in jobs].count(JobStatus.RETRY_WAIT) == 2
     assert [job.status for job in jobs].count(JobStatus.PENDING) == 2
     for job in jobs:
         assert job.claim_token is None
         assert job.lease_expires_at is None
-        if job.status is JobStatus.FAILED:
+        if job.status is JobStatus.RETRY_WAIT:
             assert job.error_info == {"code": "cancelled", "retryable": True}
             assert job.attempt_count == 1
             assert job.finished_at is not None
+            assert job.next_attempt_at is not None
         else:
             assert job.attempt_count == 0
             assert job.error_info is None
@@ -283,7 +284,8 @@ async def test_fatal_consumer_error_propagates_after_other_claims_are_cleaned_up
     assert cancelled.is_set()
     assert disposed.is_set()
     job = (await read_jobs(concurrency_database, ids))[0]
-    assert job.status is JobStatus.FAILED
+    assert job.status is JobStatus.RETRY_WAIT
+    assert job.next_attempt_at is not None
     assert job.attempt_count == 1
     assert job.error_info == {"code": "cancelled", "retryable": True}
     assert job.claim_token is None
