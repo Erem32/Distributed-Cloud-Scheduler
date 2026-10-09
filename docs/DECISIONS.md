@@ -30,8 +30,9 @@ transport use case before adding an adapter contract.
 
 **Consequences:** No cloud dependencies in the initial foundation. A milestone
 cannot finish without its acceptance checks and current documentation. Terraform
-and deployment follow a stable application model; the queue interface follows
-working local execution. Significant scope changes need a new decision.
+and deployment were originally reserved for a stable application model; D019 now
+defers them indefinitely under the user's zero-cost scope. Significant scope
+changes need a new decision.
 
 ## D002 — PostgreSQL owns authoritative job state
 
@@ -619,8 +620,9 @@ The scheduler CLI admits one bounded batch with --once or runs a local polling
 loop, owning its engine and using portable stop/drain/cancel handling. Continuous
 mode retries database outages; --once surfaces errors. Settings bound batch size,
 poll interval and shutdown grace. Deployment must choose managed invocation or
-appropriate always-running CPU for admission in milestone 15; local polling is
-not evidence that an idle Cloud Run service will execute background work.
+appropriate always-running CPU for admission if cloud deployment is ever
+separately authorized; local polling is not evidence that an idle Cloud Run
+service will execute background work.
 
 **Context:** Pub/Sub cannot be the authority for arbitrary delayed eligibility.
 An early duplicate ID must neither execute future work nor erase its future
@@ -817,3 +819,60 @@ so rebuilds are not guaranteed to be byte-for-byte identical. A built OCI image
 is the deployment artifact and its digest identifies the exact resolved image.
 Compose grants worker/scheduler up to 65 seconds to stop, matching the configured
 60-second maximum drain plus margin. Non-HTTP roles have no HTTP healthcheck.
+
+## D018 - Zero-spend boundary for cloud deployment
+
+**Date:** 2026-10-09
+
+**Status:** Superseded by D019
+
+**Decision:** Initially allow local Terraform preparation but prohibit applying
+it, enabling GCP APIs, creating resources, deploying services, or running
+cloud-side planning/refresh operations. The contemplated target region was
+`europe-west1` with an IAM-private API.
+
+**Context:** This is a learning project, and the user explicitly authorized no
+GCP spending while selecting Terraform-only preparation. Terraform and `gcloud`
+are not installed in the current environment.
+
+**Alternatives:** Provision a trial environment and rely on teardown or budgets;
+perform read-only cloud planning against an account; pause all milestone work.
+
+**Reasoning:** Avoiding cloud operations is the only reliable way to respect the
+zero-spend constraint. Budgets, teardown, and a plan that contacts GCP are not
+equivalent to guaranteeing no cloud-side activity. Local Terraform authoring
+does not create GCP resources, but source validation remains blocked until the
+Terraform CLI is available.
+
+**Consequences:** Superseded by D019, which defers cloud deployment indefinitely
+and replaces this milestone with local-only demo hardening.
+
+## D019 - Cost-free local demo; defer cloud deployment
+
+**Date:** 2026-10-09
+
+**Status:** Accepted
+
+**Decision:** Keep the project demo local-only. Do not provision or run GCP
+resources, enable paid APIs, use hosted/billable CI, or require cloud credentials.
+Use loopback-bound Docker Compose services for PostgreSQL, API, worker and
+scheduler; keep Pub/Sub optional and emulator-only. Preserve the existing default
+Compose startup and provide an opt-in profile for the full local demo.
+
+**Context:** The user requires the entire learning/demo project to remain
+cost-free and approved replacing the cloud-deployment milestone with local-only
+demo hardening. Cloud resources, free-tier limits and hosted-runner quotas cannot
+guarantee zero spend.
+
+**Alternatives:** Rely on cloud free tiers, budgets, resource teardown or
+unapplied Terraform; continue with GCP as the planned final demonstration.
+
+**Reasoning:** Local PostgreSQL, application processes and the Pub/Sub emulator
+exercise the project's behavior without creating cloud resources or relying on
+usage quotas. Avoiding cloud and hosted CI is the only reliable way to keep the
+project itself from generating cloud/service charges.
+
+**Consequences:** Cloud architecture references are educational/deferred only;
+they are not deployment instructions or validated behavior. No Terraform,
+cloud IAM or production delivery acceptance is required. Any change that adds a
+hosted or billable service needs separate explicit user authorization.

@@ -41,7 +41,7 @@ services:
   worker:
     image: distributed-cloud-scheduler:local
     build: .
-    profiles: ["roles"]
+    profiles: ["roles", "demo"]
     command: ["python", "-m", "distributed_cloud_scheduler.worker"]
     environment:
       DATABASE_URL: ${COMPOSE_DATABASE_URL:?Set COMPOSE_DATABASE_URL with host db and port 5432 in .env}
@@ -53,7 +53,7 @@ services:
   scheduler:
     image: distributed-cloud-scheduler:local
     build: .
-    profiles: ["roles"]
+    profiles: ["roles", "demo"]
     command: ["python", "-m", "distributed_cloud_scheduler.scheduler"]
     environment:
       DATABASE_URL: ${COMPOSE_DATABASE_URL:?Set COMPOSE_DATABASE_URL with host db and port 5432 in .env}

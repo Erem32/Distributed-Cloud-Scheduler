@@ -1,16 +1,16 @@
 # Distributed Cloud Task Scheduler
 
-A portfolio backend project focused on explainable distributed job execution,
-PostgreSQL transactions, delivery semantics and failure recovery. Development is
-local-first and follows validated milestones. The local foundation contains a
-FastAPI API, persisted jobs with optional submission idempotency, atomic execution,
-scheduled jobs with a separate scheduler, bounded priority preference with aging,
-bounded execution retries, dead-letter
-context, manual recovery, attempt history
-and durable dispatch obligations,
-PostgreSQL connectivity, explicit Alembic migrations, container setup and a
-Pub/Sub publisher/push worker validated with the local emulator. Cloud deployment
-is planned work; see the
+A cost-free-to-run, local-first learning backend focused on explainable
+distributed job execution, PostgreSQL transactions, delivery semantics and
+failure recovery. The local demo contains a FastAPI API, persisted jobs with
+optional submission idempotency, atomic execution, scheduled jobs with a
+separate scheduler, bounded priority preference with aging, bounded execution
+retries, dead-letter context, manual recovery, attempt history and durable
+dispatch obligations, PostgreSQL connectivity, explicit Alembic migrations,
+container setup, and an optional Pub/Sub publisher/push worker validated with
+the local emulator. GCP
+deployment is deferred indefinitely; no cloud services are required or used by
+the local demo. See the
 [living plan](docs/PLAN.md).
 
 ## Current architecture
@@ -22,9 +22,9 @@ flowchart LR
     Scheduler[Scheduler CLI] -->|Admit due jobs and commit outbox| DB
     Worker[Local polling worker] -->|Claim and persist outcomes| DB
     Worker --> Tasks[Deterministic handlers]
-    Dispatcher[Pub/Sub dispatcher CLI] -->|Lease and finalize outbox| DB
-    Dispatcher -->|Publish job ID| Queue[Pub/Sub or local emulator]
-    Queue --> Delivery[Dedicated HTTP push worker]
+    Dispatcher[Optional Pub/Sub dispatcher CLI] -->|Lease and finalize outbox| DB
+    Dispatcher -->|Publish job ID| Queue[Local Pub/Sub emulator]
+    Queue --> Delivery[Optional dedicated HTTP push worker]
     Delivery -->|Claim by ID and persist outcome| DB
     Delivery --> Tasks
     Migrations[Explicit Alembic command] --> DB
@@ -38,7 +38,8 @@ without adding placeholder domain tables; revisions 0002 and 0003 add jobs and
 execution ownership/outcomes. Revision 0004 adds the transactional dispatch outbox
 and backfills existing PENDING, QUEUED and RUNNING jobs. Direct database polling
 and Pub/Sub push both use the same execution ownership rules. The push worker
-runs separately from the submission API so Cloud Run service IAM can protect it.
+runs separately from the submission API; Cloud Run service IAM is deferred design
+guidance and is not used by the local demo.
 Revision 0005 adds nullable submission keys/fingerprints and their database constraints;
 existing jobs retain their identities and execution/dispatch state.
 Revision 0006 adds durable retry timing and execution attempt history. Existing
@@ -50,14 +51,17 @@ a partial due index. Legacy submissions keep NULL dates and their original hashe
 Revision 0009 adds immutable priority and internal readiness timestamps for bounded
 preference with aging. Legacy priority is zero and retains every original hash.
 
-The target cloud stack is GCP Pub/Sub, Cloud Run and Cloud SQL, added after local
-execution and concurrency have been proved. See the
-[specification](docs/PROJECT_SPEC.md) for the target design and reliability goals.
+The local demo uses PostgreSQL and application processes on the developer's
+machine. The optional Pub/Sub path uses only the local emulator. Cloud deployment
+is explicitly out of scope, so the demo does not require GCP credentials, paid
+APIs, or provisioned infrastructure. See the
+[specification](docs/PROJECT_SPEC.md) for the boundaries.
 
 ## Local setup
 
-Use Python 3.12+ and Docker Desktop with Linux containers, or Docker Engine with
-Compose on Linux. No GCP account is needed. Create and activate a virtual environment:
+Use Python 3.12+ and Docker Compose with a local container runtime. The demo
+does not use GCP, paid APIs, or hosted services. Create and activate a virtual
+environment:
 
 ```powershell
 python -m venv .venv
@@ -80,10 +84,10 @@ been created does not change the existing database's credentials.
 Start PostgreSQL and build the API image, then migrate explicitly:
 
 ```text
-docker compose up -d --wait db
+docker compose --profile demo up -d --wait db
 docker compose build api
 docker compose run --rm api python -m alembic upgrade head
-docker compose up -d api
+docker compose --profile demo up -d --wait api worker scheduler
 ```
 
 The image uses a multi-stage Python 3.12 slim build, installs only runtime
@@ -115,21 +119,27 @@ Database URLs differ inside Compose (`db:5432`) and on the host
 
 The API Compose healthcheck uses `/ready`, so it reports unhealthy when its
 database is unavailable; `/health` remains the dependency-independent liveness
-probe. Worker and scheduler are opt-in long-running roles using the same image:
+probe. The `demo` profile starts the worker and scheduler locally using the same
+image, enabling immediate execution and delayed-job admission without cloud
+connections. The `roles` profile remains an alias:
 
 ```text
-docker compose --profile roles up -d worker scheduler
+docker compose --profile demo up -d worker scheduler
 docker compose stop worker scheduler
 ```
 
-The optional roles do not change the default `db` and `api` startup. Compose
-allows up to 65 seconds for worker/scheduler shutdown, covering the configured
+Neither profile changes the default `db` and `api` startup. Compose allows up to
+65 seconds for worker/scheduler shutdown, covering the configured
 60-second maximum drain time. Those roles have no HTTP health probe; their
 database-backed runtime behavior and process status are monitored separately.
 
-`docker compose down` stops/removes the project containers and network while
-preserving database data. Compose remains a local-development environment; cloud
-deployment and its infrastructure follow later milestones.
+Stop the local stack without deleting its database volume using
+`docker compose --profile demo down`. To also erase local database data, run
+`docker compose --profile demo down --volumes`; this is destructive and does not
+affect any remote service. Application and database ports bind to `127.0.0.1`.
+Docker image/package downloads may require an internet connection, but the
+application does not contact GCP or create billable resources. Host container
+runtime licensing and electricity/network costs, if any, are outside the project.
 
 ## API and configuration
 
@@ -152,6 +162,10 @@ $job = Invoke-RestMethod -Uri http://127.0.0.1:8000/jobs -Method Post -ContentTy
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/jobs/$($job.id)"
 Invoke-RestMethod -Uri 'http://127.0.0.1:8000/jobs?limit=20&offset=0'
 ```
+
+With the `demo` profile running, the local worker claims the calculation. Query
+the job again after a moment to see `status: SUCCEEDED` and
+`result_metadata.sum: 6`.
 
 Run the worker on the host or using the existing image:
 
@@ -335,6 +349,9 @@ offset, seconds and at most six fractional digits. For example:
 ```powershell
 $scheduledBody = @{ type = 'calculation'; payload = @{ numbers = @(1, 2, 3) }; scheduled_at = [datetimeoffset]::UtcNow.AddSeconds(30).ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ') } | ConvertTo-Json
 $scheduledJob = Invoke-RestMethod -Uri http://127.0.0.1:8000/jobs -Method Post -ContentType 'application/json' -Body $scheduledBody
+$scheduledJob.status
+Start-Sleep -Seconds 35
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/jobs/$($scheduledJob.id)"
 ```
 
 Dates normalize to UTC. Naive/date-only timestamps, numeric epochs, invalid
@@ -367,13 +384,15 @@ keeps the intent for its next pass. Initial PENDING/QUEUED claims also check the
 original database due time. Retry backoff continues to use next_attempt_at;
 manual recovery retains scheduled_at but opens an immediate new generation.
 
+In the `demo` profile the scheduler and worker are already running continuously,
+so the scheduled job is admitted after its due time and then executed locally.
 Scheduler shutdown stops new batches, drains the current transaction within the
 configured grace period and then cancels it. Database connection failures retry
 in continuous mode; `--once` reports failure with a nonzero exit. Scheduling is
 eventual: polling interval, locks, database outages, dispatch and worker capacity
 can delay execution beyond the requested instant. No recurrence or schedule-edit
-interface is provided. Cloud scheduler invocation/CPU policy remains milestone 15;
-an idle Cloud Run service is not assumed to run this polling loop.
+interface is provided. The local demo runs the scheduler as a continuously
+polling process; cloud scheduler policy is deferred and is not part of this project.
 
 Migration 0008 preserves legacy jobs, keys and obligations. Stop runtimes before
 migrating. Downgrade takes table locks before checking and refuses while any job
@@ -489,8 +508,8 @@ Pub/Sub dead-letter topics quarantine messages that cannot be delivered and
 acknowledged. Broker delivery limits are approximate and independent of execution
 budgets; forwarding alone cannot establish that a database job failed. Such
 messages need inspection against authoritative job state before manual recovery.
-Production dead-letter topic/subscription policy, IAM and monitoring are deferred
-to milestone 15; local smoke does not configure broker dead-letter forwarding.
+Production dead-letter topic/subscription policy, IAM and monitoring are out of
+scope; local smoke does not configure broker dead-letter forwarding.
 See [D013](docs/DECISIONS.md) and Google's
 [dead-letter topic documentation](https://docs.cloud.google.com/pubsub/docs/dead-letter-topics).
 
@@ -592,9 +611,9 @@ to at least 60 seconds, allowing time for cancellation cleanup. Driver cleanup c
 add latency. Size replica concurrency and database connection pools together.
 
 Local HTTP has no sender authentication. Subscription matching validates routing,
-not identity. Deploy this worker as a private Cloud Run service with Pub/Sub OIDC
-and `roles/run.invoker`; Cloud Run validates the token and audience. Service IAM,
-cloud delivery and infrastructure have not been validated here. See
+not identity. The private Cloud Run deployment with Pub/Sub OIDC and
+`roles/run.invoker` is deferred design guidance only; this project does not deploy
+or validate GCP IAM or cloud delivery. See
 [D010](docs/DECISIONS.md) and Google's [authenticated push documentation](https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions).
 
 ## Local Pub/Sub emulator verification

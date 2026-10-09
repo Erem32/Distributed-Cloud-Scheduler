@@ -5,8 +5,9 @@
 Build a small, carefully engineered distributed backend that accepts jobs,
 executes them asynchronously, and makes their lifecycle and failure behavior
 observable. The repository should support credible discussion of transactions,
-concurrency, delivery semantics, recovery, cloud deployment, and performance.
-Engineering depth and reproducible evidence matter more than feature count.
+concurrency, delivery semantics, recovery, and performance through a reproducible
+local demo. Cloud deployment is deferred indefinitely to keep the learning project
+free to run.
 
 This is the stable specification, not an implementation status report. See
 [PLAN.md](PLAN.md) for the architecture that currently exists, milestone status,
@@ -21,21 +22,23 @@ the intended completed system unless explicitly identified as a foundation.
 | Application | Python 3.12+, FastAPI, Pydantic, asyncio where appropriate |
 | Persistence | PostgreSQL, SQLAlchemy 2.x, psycopg 3, Alembic |
 | Local development | Docker, Docker Compose, environment-based configuration |
-| Cloud target | GCP: Cloud Run, Pub/Sub, Cloud SQL for PostgreSQL, Artifact Registry |
-| Infrastructure and delivery | Terraform, GitHub Actions |
+| Cloud services | None required; GCP adapters are not deployed |
+| Infrastructure and delivery | Local Docker Compose and `scripts/check.py`; no hosted CI |
 | Quality | pytest, Ruff, mypy, one standard verification command |
 | Operations | Structured logging, useful metrics, reproducible load/failure experiments |
 
-Local metrics use Prometheus text exposition; cloud collection and load-testing
-tools will be selected when their deployment/experiment requirements are clear.
+Local metrics use Prometheus text exposition. Cloud metrics collection is out of
+scope; load-testing tools will be selected when local experiment requirements are
+clear.
 Changes to a major framework, database, transport, cloud, or orchestration
 platform require an explicit recorded justification.
 
 ## Architecture
 
-Development proceeds locally: first establish the API and database, then prove
-job persistence, local execution, and concurrency before introducing messaging
-or cloud resources. The initial foundation has this bounded design:
+Development proceeds locally: establish the API and database, then prove job
+persistence, local execution, and concurrency. Messaging is exercised with a
+local emulator; cloud resources are outside scope. The initial foundation has
+this bounded design:
 
 ```mermaid
 flowchart LR
@@ -44,7 +47,8 @@ flowchart LR
     Migrations[Alembic migration command] --> DB
 ```
 
-The provisional final cloud design is:
+The following cloud architecture is deferred design context only. It is not
+implemented as deployment infrastructure and is not part of the demo or acceptance:
 
 ```mermaid
 flowchart LR
@@ -65,7 +69,8 @@ together; scheduled submissions retain durable admission intent until D014's
 scheduler atomically commits due admission and its outbox. Publish outside the
 transaction, and finalize publication with fenced ownership. A crash
 after acceptance can replay publication, so workers must tolerate duplicate IDs.
-The cloud dispatcher and scheduler hosting model still requires deployment design.
+The cloud dispatcher and scheduler hosting model remains unresolved and is not
+needed by the local demo.
 
 PostgreSQL is the authoritative store of job state. Messages identify jobs;
 workers load authoritative data from the database. Transport adapters must not
@@ -80,8 +85,9 @@ only a base64-encoded canonical job UUID. It acknowledges durable terminal outco
 retry intent with a replacement outbox obligation, or scheduled admission intent,
 and requests redelivery while execution or dependency recovery remains outstanding.
 D010 defines bounded request execution and the initial acknowledgement policy;
-execution retry policy is separate. Production access requires private Cloud Run
-service IAM and authenticated Pub/Sub push. Local emulator delivery cannot validate IAM.
+execution retry policy is separate. A future production deployment would require
+private service IAM and authenticated Pub/Sub push; neither is part of the current
+local-only project. Local emulator delivery does not validate IAM.
 
 ## Major components
 
@@ -91,13 +97,14 @@ service IAM and authenticated Pub/Sub push. Local emulator delivery cannot valid
   transactional claims, idempotency records, and diagnostic attempt history.
 - **Execution:** deterministic task handlers and bounded worker concurrency;
   cooperative shutdown and isolated failures where practical.
-- **Transport:** durable outbox dispatch, local/test delivery followed by Pub/Sub
-  delivery, with explicit acknowledgement and failure behavior.
+- **Transport:** durable outbox dispatch, local/test delivery followed by
+  optional Pub/Sub delivery with explicit acknowledgement and failure behavior;
+  the Pub/Sub path uses the local emulator only.
 - **Scheduler:** discover due jobs safely across restarts and multiple instances.
-- **Operations:** configuration, container entry points, infrastructure, CI,
-  redacted structured lifecycle logs, bounded-cardinality metrics, and
-  reproducible experiments. Local scrape metrics are process-local; fleet
-  aggregation/export is a deployment-stage concern.
+- **Operations:** configuration, local container entry points, redacted
+  structured lifecycle logs, bounded-cardinality metrics, and reproducible
+  experiments. Local scrape metrics are process-local; fleet aggregation/export
+  is not part of the cost-free local demo.
 
 ## Core capabilities and interfaces
 
@@ -186,13 +193,15 @@ unbounded job duration is a project guarantee.
 Use Swagger/OpenAPI as the interface. Do not build a React frontend, user account
 management, payments, AI features, a service mesh, Kafka, initial Kubernetes, or
 a general workflow framework. Application authentication is outside initial
-scope; cloud service-to-service access still requires appropriate IAM.
+scope; cloud service-to-service access would require appropriate IAM if cloud
+deployment were ever separately authorized. The current project does not
+provision or use cloud IAM.
 
 Avoid premature microservices, generic repository frameworks, and abstractions
-without a real second use case. Cloud-managed capabilities should replace custom
-infrastructure when they fit. Configuration comes from the environment locally
-and suitable secret/configuration mechanisms in production; secrets stay outside
-source control. GCP provisioning is deferred until local behavior is stable.
+without a real second use case. Configuration comes from the environment locally;
+secrets stay outside source control. The project intentionally does not provision
+GCP or depend on paid services, hosted CI, or cloud credentials. Cloud deployment
+is deferred indefinitely unless the user explicitly changes this scope.
 
 ## Expected final demonstration
 
@@ -202,8 +211,8 @@ source control. GCP provisioning is deferred until local behavior is stable.
    jobs, bounded retries, exhausted jobs, and manual recovery with clear traces.
 3. Interrupt workers and inject dependency/task failures; show recovery and the
    limits of the chosen ownership/side-effect semantics.
-4. Deploy the same application model to GCP through documented Terraform and
-   delivery workflows, with authenticated Pub/Sub push and observable outcomes.
+4. Optionally demonstrate Pub/Sub delivery against the local emulator without a
+   GCP account, cloud credentials, or provisioned services.
 5. Compare concurrency configurations such as 1, 5, 10, and 20; report throughput,
    p50/p95/p99 latency, failures, resource usage, and the measured bottleneck.
 6. Inject approximately 10% transient failures; report initial and eventual
@@ -216,9 +225,10 @@ CPU-bound work.
 
 ## Definition of success
 
-A new engineer can reproduce setup, tests, deployment, and experiments from the
-repository. Critical correctness claims have unit, PostgreSQL integration,
-concurrency, and end-to-end evidence as appropriate. The standard verification
+A new engineer can reproduce local setup, tests, and experiments from the
+repository without a cloud account or paid service. Critical correctness claims
+have unit, PostgreSQL integration, concurrency, and end-to-end evidence as
+appropriate. The standard verification
 command passes lint, type checking, and tests. Documentation differentiates
 implemented behavior from goals and limitations, and the plan remains current.
 

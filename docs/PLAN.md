@@ -1,8 +1,8 @@
 # Project status
 
-- **Current milestone:** 14 - production containerization (COMPLETE; awaiting
-  approval to start milestone 15).
-- **Current state:** Milestones 0-14 pass their local acceptance criteria.
+- **Current milestone:** 15 - free local demo hardening (COMPLETE; awaiting
+  approval to start milestone 16).
+- **Current state:** Milestones 0-15 pass their local acceptance criteria.
   On Python 3.13.1, `python scripts/check.py` passes Ruff, strict mypy (22 source
   files), and all 849 tests without skips. PostgreSQL is at revision 0009 and
   `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
@@ -44,7 +44,27 @@
   and `/ready` returned 200; API, worker and scheduler all started and exited 0
   on SIGTERM. `python scripts/check.py` passes Ruff, strict mypy (22 source files)
   and all 849 tests with no skips.
-- **Next objective:** Await approval before starting milestone 15.
+- **Milestone 15 scope:** User requires the learning/demo experience to remain
+  cost-free and approved replacing cloud deployment with local-only demo
+  hardening. Do not provision, plan against, or deploy to GCP; do not enable
+  paid APIs or use hosted/billable CI. Terraform and `gcloud` are not installed
+  and are no longer required for this milestone.
+- **Milestone 15 acceptance design:** Preserve the existing default Compose
+  services; provide an explicit local demo profile for API, PostgreSQL, worker
+  and scheduler; bind application/database ports to loopback; document a full
+  local submission-to-terminal-result path and teardown; prove immediate and
+  scheduled execution work without GCP credentials or a cloud account. The
+  optional Pub/Sub emulator remains local-only.
+- **Milestone 15 validation:** Default Compose still selects only `db` and `api`;
+  the `demo` profile adds worker and scheduler with all published ports bound to
+  `127.0.0.1`. In an isolated local Compose project, migrations reached 0009,
+  readiness passed, an immediate calculation completed with result 6, and a
+  future scheduled job stayed SCHEDULED until due then completed with result 9.
+  No images were pulled, no cloud services were used, and the isolated containers,
+  network and volume were removed. Ruff and strict mypy pass; all 849 tests pass
+  without skips; `alembic check` reports no drift.
+- **Next objective:** Await approval before starting milestone 16. Continue to
+  exclude GCP provisioning, hosted CI and paid services.
 - **Milestone 14 design:** Build one multi-stage Python 3.12 slim image, install
   only the project's runtime dependencies, and run directly as the existing
   unprivileged UID. Keep the API as the image default and use its existing module
@@ -58,7 +78,8 @@
   scheduler roles. Verify API `/health` and database-backed `/ready`, role
   shutdown on SIGTERM within the configured grace period, and a separate explicit
   migration command. Keep Compose's default API/database behavior unchanged.
-- **Session boundary:** Do not start milestone 15 without user authorization.
+- **Session boundary:** User approved milestone 15 as local-only demo hardening
+  on 2026-10-09; GCP provisioning, hosted CI and paid services remain prohibited.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -312,7 +333,7 @@ flowchart LR
   dead_lettered_at and the final safe error/attempt record. Permanent errors remain
   FAILED. Broker dead-letter forwarding quarantines undeliverable transport messages;
   it never determines execution counts or changes job state. Production policy/IAM
-  provisioning remains milestone 15.
+  provisioning is deferred indefinitely and excluded from the local demo.
 - **Acceptance:** POST /jobs/{id}/retry accepts a strict body containing
   expected_generation (integer 0..2147483647). Only FAILED/DEAD_LETTERED jobs with
   that current generation may reopen. Under one row lock, increment generation,
@@ -372,7 +393,7 @@ flowchart LR
   batch size, poll interval and shutdown timeout. Partial due index and migration
   0008 preserve legacy rows; downgrade locks before checking and refuses while any
   non-NULL scheduled_at remains, including completed jobs, protecting schedule/key
-  semantics. Hosted scheduler invocation/CPU policy is deferred to milestone 15.
+  semantics. Hosted scheduler invocation/CPU policy is out of scope.
 - **Validation:** Standard venv checks without skips; strict datetime/hash/config
   and runtime tests; real PostgreSQL future/due gating, bounded ordered admission,
   independent scheduler/worker/push races, restart, atomic rollback/cancellation,
@@ -504,30 +525,45 @@ flowchart LR
   and scheduler all stopped with exit code 0 on SIGTERM. Standard checks passed:
   Ruff, strict mypy and 849 tests without skips.
 
-## 15 - Terraform and GCP deployment
+## 15 - Free local demo hardening
 
-- **Status:** NOT STARTED.
-- **Objective:** Provision a minimal explainable cloud system after behavior stabilizes.
-- **Tasks:** Required APIs, Artifact Registry, Pub/Sub/DLQ as chosen, Cloud SQL, Cloud Run
-  roles, scheduler hosting, IAM and secrets; deploy/runbook and teardown instructions.
-- **Design questions:** Least privilege, push OIDC, DB connection budget, public demo
-  exposure, regionality and cost; ask before spending materially or irreversible changes.
-- **Acceptance:** Terraform validates/plans; a reviewed authorized deployment runs
-  submission through terminal state; no credentials in source/state artifacts in Git.
-- **Validation:** fmt/validate/plan and cloud end-to-end smoke when credentials and cost
-  authorization exist. Without them this milestone remains incomplete.
+- **Status:** COMPLETE (cloud deployment deferred indefinitely).
+- **Objective:** Make the learning project easy to demonstrate locally without
+  paid services, cloud accounts, hosted CI, or provisioned infrastructure.
+- **Design:** Keep PostgreSQL authoritative and use local Docker Compose services.
+  Add an opt-in `demo` profile to start API, worker and scheduler while preserving
+  the existing default `db`/`api` behavior. Keep exposed ports on loopback, run
+  migrations explicitly, and keep Pub/Sub emulator delivery optional. Cloud
+  adapters remain source-level architecture only and are not part of the demo path.
+- **Acceptance:** Compose's default profile remains unchanged; the `demo` profile
+  starts local API/database/worker/scheduler. From the documented flow, an
+  immediate calculation reaches `SUCCEEDED` with its result, and a future
+  scheduled job remains scheduled until due and is then admitted/executed. No GCP
+  account, credentials, cloud resource, paid API or hosted runner is needed.
+  Document safe shutdown and persistence cleanup. Validate both Compose
+  configurations and run `python scripts/check.py`; no cloud command is permitted.
+- **Validation:** Inspect resolved Compose profiles/ports and run the demo
+  end-to-end against isolated local resources. Run the standard quality command.
+  Local image/package downloads may use the network but must not contact or create
+  paid cloud resources. Do not claim cloud behavior was validated.
+- **Result:** The default and `demo` Compose profiles were checked; loopback
+  binding, migration, readiness, immediate execution and scheduled execution all
+  passed in an isolated local project. The standard check passed Ruff, strict
+  mypy and 849 tests without skips; schema drift check passed. No cloud action
+  occurred.
 
-## 16 - GitHub Actions
+## 16 - Local verification automation
 
-- **Status:** NOT STARTED.
-- **Objective:** Automate equivalent local quality gates, then authorized deployment.
-- **Tasks:** PR lint/types/tests/build with PostgreSQL services; reproduce the standard
-  check command; add image publication/deployment separately with workload identity.
-- **Design questions:** Protect deployment environments, avoid stored service-account
-  keys, cache safely and pin CI dependencies. Tooling is established earlier; CI waits here.
-- **Acceptance:** PR checks run reproducibly; deployment automation is validated only
-  when a cloud environment exists and publication is authorized.
-- **Validation:** Local workflow-equivalent commands and actual workflow run results.
+- **Status:** NOT STARTED (hosted runners and deployment automation deferred).
+- **Objective:** Preserve reproducible, cost-free local verification.
+- **Tasks:** Keep `python scripts/check.py` as the local quality gate. Do not add
+  hosted workflows or image publication/deployment that can consume paid quotas
+  unless the user separately authorizes the resulting cost/risk.
+- **Design questions:** Keep verification local and avoid workflows or tools that
+  transfer data to hosted/billable services. Do not add deployment automation.
+- **Acceptance:** Local verification remains reproducible with no hosted service.
+- **Validation:** Run local quality commands; no hosted workflow or cloud deployment
+  is required or authorized.
 
 ## 17 - Load tests and benchmarks
 
@@ -539,7 +575,8 @@ flowchart LR
   DB/broker limits, fairness and CPU vs I/O workloads.
 - **Acceptance:** Reproducible jobs/s, p50/p95/p99, failure rate and resource measurements;
   honest interpretation explains nonlinear scaling.
-- **Validation:** Repeat benchmark runs with bounded duration/cost and documented variance.
+- **Validation:** Repeat local benchmark runs with bounded duration and documented
+  resource usage and variance; no cloud or paid load-testing service.
 
 ## 18 - Reliability experiment
 
@@ -618,8 +655,8 @@ Validation completed on 2026-10-09:
   and disposable resources clean up. Compose configuration and host/container pip
   checks pass; the non-root Linux image builds and runs the same policy.
 
-Cloud scheduler invocation/CPU policy and broker DLQ/IAM remain deployment-stage
-validation in milestone 15. Local polling makes no cloud hosting claim.
+Cloud scheduler invocation/CPU policy and broker DLQ/IAM are deferred indefinitely.
+Local polling and emulator results make no cloud hosting or IAM claim.
 
 The roadmap is intentionally sequential. Basic atomic claiming is required before
 concurrency, and durable publication/reconciliation is required before Pub/Sub.
@@ -675,13 +712,13 @@ Verification on 2026-10-09:
 - D014: durable scheduled admission, database-clock eligibility and compatible schedule identity.
 - D015: bounded priority preference, eligibility-episode aging and unchanged ID authority.
 - D016: redacted lifecycle logs, bounded Prometheus metrics and process-local scope.
+- D018: zero-spend boundary; superseded by D019's local-only scope.
+- D019: free local demo; GCP provisioning and hosted/billable automation deferred.
 
 # Risks / technical debt
 
-- Milestones 0-12's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
-  deployment-stage validation, not evidence supplied by the emulator.
-- No cloud environment or spending authorization has been established. Cloud rollout
-  must not be claimed validated from local tests.
+- Milestones 0-14's local acceptance checks pass. Cloud IAM/provisioning/delivery
+  are deferred indefinitely; local tests do not validate cloud behavior.
 - Cloud IAM, broker DLQ operations and dispatcher/scheduler hosting still need
   deployment/reliability decisions. Priority cannot impose global broker execution order.
 - Metrics are process-local; API/push expose scrape endpoints, but CLI-only metrics
@@ -713,5 +750,6 @@ Verification on 2026-10-09:
 
 # Next actions
 
-1. Ask whether to start milestone 13; do not begin it without authorization.
-2. Keep cloud hosting/DLQ/IAM in milestone 15; benchmark query costs at milestone 17.
+1. Finish the local-only demo profile, walkthrough and local end-to-end acceptance.
+2. Keep GCP provisioning and hosted/billable automation out of scope unless the user
+   explicitly changes the zero-cost requirement.
