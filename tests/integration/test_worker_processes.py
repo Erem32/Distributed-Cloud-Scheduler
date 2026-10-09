@@ -10,8 +10,6 @@ from uuid import UUID
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from pydantic import JsonValue
 from sqlalchemy import select, text
 
@@ -21,10 +19,12 @@ from distributed_cloud_scheduler.jobs import Job, JobCreate, JobStatus, create_j
 
 
 @pytest_asyncio.fixture
-async def process_database(integration_database_url: str) -> AsyncIterator[Database]:
-    project_root = Path(__file__).resolve().parents[2]
-    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
-    database = Database(Settings(database_url=integration_database_url, _env_file=None))
+async def process_database(
+    migrated_integration_database_url: str,
+) -> AsyncIterator[Database]:
+    database = Database(
+        Settings(database_url=migrated_integration_database_url, _env_file=None)
+    )
     try:
         yield database
     finally:

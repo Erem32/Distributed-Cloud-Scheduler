@@ -7,11 +7,21 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from alembic import command
+from alembic.config import Config
 from dotenv import dotenv_values
 from psycopg import sql
 from sqlalchemy.engine import make_url
 
 from distributed_cloud_scheduler.config import Settings
+
+
+@pytest.fixture
+def migrated_integration_database_url(integration_database_url: str) -> str:
+    """Upgrade this test's isolated schema to head for ordinary DB integration tests."""
+    project_root = Path(__file__).resolve().parents[2]
+    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
+    return integration_database_url
 
 
 @pytest.fixture

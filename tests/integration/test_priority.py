@@ -51,9 +51,12 @@ def settings_for(database: Database) -> Settings:
 
 
 @pytest_asyncio.fixture
-async def priority_database(integration_database_url: str) -> AsyncIterator[Database]:
-    command.upgrade(migration_config(), "head")
-    database = Database(Settings(database_url=integration_database_url, _env_file=None))
+async def priority_database(
+    migrated_integration_database_url: str,
+) -> AsyncIterator[Database]:
+    database = Database(
+        Settings(database_url=migrated_integration_database_url, _env_file=None)
+    )
     try:
         yield database
     finally:

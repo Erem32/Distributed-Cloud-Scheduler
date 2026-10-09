@@ -1,7 +1,8 @@
 # Project status
 
-- **Current milestone:** 12 - observability (COMPLETE).
-- **Current state:** Milestones 0-12 pass their local acceptance criteria.
+- **Current milestone:** 13 - integration and failure testing (COMPLETE; awaiting
+  approval to start milestone 14).
+- **Current state:** Milestones 0-13 pass their local acceptance criteria.
   On Python 3.13.1, `python scripts/check.py` passes Ruff, strict mypy (22 source
   files), and all 849 tests without skips. PostgreSQL is at revision 0009 and
   `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
@@ -15,8 +16,26 @@
   labels are permitted. Histograms record HTTP request latency and each handler
   attempt's execution duration; p50/p95/p99 are estimated from cumulative buckets
   with Prometheus `histogram_quantile`, not asserted as exact values.
-- **Next objective:** Milestone 13 - integration and failure testing.
-- **Session boundary:** Milestone 12 is committed; ask before starting milestone 13.
+- **Milestone 12 commit:** `f18448f6519eb01f565673e54f6b02426955229b`.
+- **Milestone 13 design:** Preserve real-PostgreSQL assertions for durable state
+  and allowed effects; use synchronization/fault injection rather than timing
+  assumptions; retain isolated random schemas and mandatory database execution.
+  A shared migration fixture upgrades ordinary integration-test schemas to head;
+  tests intentionally validating historical revisions retain their own migration
+  lifecycle. Existing PostgreSQL and live-emulator suites already cover the
+  required failure scenarios, so no duplicate behavior tests or second harness
+  were added.
+- **Milestone 13 validation:** The focused PostgreSQL integration set passed 266
+  tests. `python scripts/check.py` passes Ruff, strict mypy (22 source files), and
+  all 849 tests with no skips. The Windows live Pub/Sub SDK/emulator/push smoke
+  passed, including terminal and duplicate ACKs, transient retry and exhaustion,
+  publisher outage recovery, worker-loss/manual recovery, delayed scheduling and
+  restart, priority selection/fairness, and malformed/unknown/oversized messages.
+  PostgreSQL regression tests also cover handler/publisher exceptions, lock
+  contention, competing schedulers, worker shutdown/loss, duplicate delivery and
+  delayed admission.
+- **Next objective:** Await approval before starting milestone 14.
+- **Session boundary:** Do not start milestone 14 without user authorization.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -416,16 +435,24 @@ flowchart LR
 
 ## 13 - Integration and failure testing
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Validate system invariants across realistic interruptions.
-- **Tasks:** Consolidate PostgreSQL/broker test fixtures and critical end-to-end cases:
-  duplicates, exceptions, transient failures, exhaustion, contention, worker crash,
-  delayed jobs, scheduler duplication and shutdown. Retain regressions discovered earlier.
-- **Design questions:** Deterministic synchronization and fault injection; avoid public
-  internet dependencies and mocks that conceal transaction behavior.
-- **Acceptance:** Critical scenarios assert durable state and allowed effects; known
-  limitations are recorded and reproducible.
-- **Validation:** Repeatable integration/failure suite plus all standard checks.
+- **Tasks:** Audit existing PostgreSQL/broker fixtures and coverage before changing
+  them; consolidate only duplicated setup. Retain critical cases for duplicates,
+  handler/publisher exceptions, transient retries/exhaustion, lock contention,
+  worker loss, delayed admission, competing schedulers and shutdown.
+- **Design:** Use PostgreSQL for transaction/locking semantics, disposable isolated
+  schemas, deterministic barriers/fault injection and the existing live Pub/Sub
+  emulator smoke. Do not substitute SQLite, public network dependencies or mocks
+  for persistence/concurrency evidence.
+- **Acceptance:** Every listed scenario must be covered by a repeatable test or
+  emulator smoke that checks persisted state and permitted side effects. Integration
+  tests must execute against PostgreSQL without skips; failures must be reproducible
+  with focused selectors and known cloud/at-least-once limitations documented.
+  Standard lint/type/test checks and the live broker smoke pass.
+- **Validation:** Inventory coverage, add regression tests only for evidenced gaps,
+  run focused PostgreSQL and emulator tests, then `python scripts/check.py` and
+  inspect final staged diff.
 
 ## 14 - Production containerization
 

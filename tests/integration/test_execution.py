@@ -3,13 +3,10 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from pydantic import JsonValue
 from sqlalchemy import text
 
@@ -23,10 +20,10 @@ LONG_RETRY = RetryPolicy(base_seconds=60, max_seconds=60)
 
 
 @pytest_asyncio.fixture
-async def execution_database(integration_database_url: str) -> AsyncIterator[Database]:
-    project_root = Path(__file__).resolve().parents[2]
-    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
-    database = Database(Settings(database_url=integration_database_url, _env_file=None))
+async def execution_database(migrated_integration_database_url: str) -> AsyncIterator[Database]:
+    database = Database(
+        Settings(database_url=migrated_integration_database_url, _env_file=None)
+    )
     try:
         yield database
     finally:

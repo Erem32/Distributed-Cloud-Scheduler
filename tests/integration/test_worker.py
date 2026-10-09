@@ -1,12 +1,9 @@
 import asyncio
 from collections.abc import AsyncIterator
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from pydantic import JsonValue
 from sqlalchemy import text
@@ -21,10 +18,8 @@ from distributed_cloud_scheduler.jobs import JobCreate, create_job, get_job
 
 
 @pytest.fixture
-def worker_settings(integration_database_url: str) -> Settings:
-    project_root = Path(__file__).resolve().parents[2]
-    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
-    url = make_url(integration_database_url).update_query_dict(
+def worker_settings(migrated_integration_database_url: str) -> Settings:
+    url = make_url(migrated_integration_database_url).update_query_dict(
         {"application_name": f"worker_test_{uuid4().hex}"}
     )
     return Settings(

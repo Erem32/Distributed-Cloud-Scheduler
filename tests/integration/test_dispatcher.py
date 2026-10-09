@@ -2,14 +2,11 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
@@ -31,10 +28,8 @@ from distributed_cloud_scheduler.worker import execute_claim, run_once
 
 
 @pytest.fixture
-def dispatch_settings(integration_database_url: str) -> Settings:
-    project_root = Path(__file__).resolve().parents[2]
-    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
-    url = make_url(integration_database_url).update_query_dict(
+def dispatch_settings(migrated_integration_database_url: str) -> Settings:
+    url = make_url(migrated_integration_database_url).update_query_dict(
         {"application_name": f"dispatch_test_{uuid4().hex}"}
     )
     return Settings(database_url=url.render_as_string(hide_password=False), _env_file=None)

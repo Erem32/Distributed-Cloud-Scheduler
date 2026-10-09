@@ -3,13 +3,10 @@
 import asyncio
 import base64
 from collections.abc import AsyncIterator
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -43,10 +40,8 @@ FAILURE = {"code": "controlled_failure", "retryable": True}
 
 
 @pytest_asyncio.fixture
-async def retry_database(integration_database_url: str) -> AsyncIterator[Database]:
-    project_root = Path(__file__).resolve().parents[2]
-    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
-    database = Database(settings_for_url(integration_database_url))
+async def retry_database(migrated_integration_database_url: str) -> AsyncIterator[Database]:
+    database = Database(settings_for_url(migrated_integration_database_url))
     try:
         yield database
     finally:

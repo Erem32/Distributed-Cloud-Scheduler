@@ -2,13 +2,10 @@
 
 import asyncio
 from collections.abc import AsyncIterator
-from pathlib import Path
 from uuid import UUID
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from pydantic import JsonValue
 from sqlalchemy.exc import OperationalError
 
@@ -19,10 +16,8 @@ from distributed_cloud_scheduler.jobs import Job, JobCreate, JobStatus, create_j
 
 
 @pytest.fixture
-def concurrency_settings(integration_database_url: str) -> Settings:
-    project_root = Path(__file__).resolve().parents[2]
-    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
-    return Settings(database_url=integration_database_url, _env_file=None)
+def concurrency_settings(migrated_integration_database_url: str) -> Settings:
+    return Settings(database_url=migrated_integration_database_url, _env_file=None)
 
 
 @pytest_asyncio.fixture

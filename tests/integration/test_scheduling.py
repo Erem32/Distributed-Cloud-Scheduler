@@ -61,9 +61,8 @@ def settings_for(database: Database, application_name: str | None = None) -> Set
 
 
 @pytest_asyncio.fixture
-async def scheduled_database(integration_database_url: str) -> AsyncIterator[Database]:
-    command.upgrade(Config(str(Path(__file__).resolve().parents[2] / "alembic.ini")), "head")
-    database = Database(settings_for_url(integration_database_url))
+async def scheduled_database(migrated_integration_database_url: str) -> AsyncIterator[Database]:
+    database = Database(settings_for_url(migrated_integration_database_url))
     try:
         yield database
     finally:

@@ -5,13 +5,10 @@ import base64
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -39,9 +36,12 @@ SUBSCRIPTION = "projects/local-project/subscriptions/jobs-push"
 
 
 @pytest_asyncio.fixture
-async def recovery_database(integration_database_url: str) -> AsyncIterator[Database]:
-    command.upgrade(Config(str(Path(__file__).resolve().parents[2] / "alembic.ini")), "head")
-    database = Database(Settings(database_url=integration_database_url, _env_file=None))
+async def recovery_database(
+    migrated_integration_database_url: str,
+) -> AsyncIterator[Database]:
+    database = Database(
+        Settings(database_url=migrated_integration_database_url, _env_file=None)
+    )
     try:
         yield database
     finally:

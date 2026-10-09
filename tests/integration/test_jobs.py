@@ -1,12 +1,9 @@
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from alembic import command
-from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -17,10 +14,8 @@ from distributed_cloud_scheduler.database import Database
 
 
 @pytest.fixture
-def migrated_job_database_url(integration_database_url: str) -> str:
-    project_root = Path(__file__).resolve().parents[2]
-    command.upgrade(Config(str(project_root / "alembic.ini")), "head")
-    return integration_database_url
+def migrated_job_database_url(migrated_integration_database_url: str) -> str:
+    return migrated_integration_database_url
 
 
 @pytest_asyncio.fixture
