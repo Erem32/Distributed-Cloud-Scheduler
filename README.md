@@ -86,6 +86,11 @@ docker compose run --rm api python -m alembic upgrade head
 docker compose up -d api
 ```
 
+The image uses a multi-stage Python 3.12 slim build, installs only runtime
+dependencies, and runs as UID 10001. The API is the default command; the same
+image provides the worker and scheduler CLIs. Migrations are deliberately a
+separate one-off command rather than part of API startup.
+
 Open [Swagger UI](http://127.0.0.1:8000/docs). Probe examples:
 
 ```text
@@ -108,9 +113,23 @@ psycopg-compatible asyncio loop on Windows. Use this entry point for host startu
 Database URLs differ inside Compose (`db:5432`) and on the host
 (`127.0.0.1:5433`); the environment example supplies both.
 
+The API Compose healthcheck uses `/ready`, so it reports unhealthy when its
+database is unavailable; `/health` remains the dependency-independent liveness
+probe. Worker and scheduler are opt-in long-running roles using the same image:
+
+```text
+docker compose --profile roles up -d worker scheduler
+docker compose stop worker scheduler
+```
+
+The optional roles do not change the default `db` and `api` startup. Compose
+allows up to 65 seconds for worker/scheduler shutdown, covering the configured
+60-second maximum drain time. Those roles have no HTTP health probe; their
+database-backed runtime behavior and process status are monitored separately.
+
 `docker compose down` stops/removes the project containers and network while
-preserving database data. This is a development environment; production hardening
-and deployment follow later milestones.
+preserving database data. Compose remains a local-development environment; cloud
+deployment and its infrastructure follow later milestones.
 
 ## API and configuration
 

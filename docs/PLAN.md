@@ -1,12 +1,14 @@
 # Project status
 
-- **Current milestone:** 13 - integration and failure testing (COMPLETE; awaiting
-  approval to start milestone 14).
-- **Current state:** Milestones 0-13 pass their local acceptance criteria.
+- **Current milestone:** 14 - production containerization (COMPLETE; awaiting
+  approval to start milestone 15).
+- **Current state:** Milestones 0-14 pass their local acceptance criteria.
   On Python 3.13.1, `python scripts/check.py` passes Ruff, strict mypy (22 source
   files), and all 849 tests without skips. PostgreSQL is at revision 0009 and
   `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
-  PostgreSQL 17 and the emulator are healthy.
+  PostgreSQL 17 and the emulator are healthy. The multi-role Python 3.12 image
+  builds, runs API/worker/scheduler as UID 10001, and passes readiness and SIGTERM
+  lifecycle smokes.
 - **Milestone 12 design:** Emit one-line JSON lifecycle events with an allowlisted
   field set and job ID correlation across API submission/retry, scheduler
   admission, dispatch and execution. Never log payloads, headers, idempotency
@@ -17,6 +19,7 @@
   attempt's execution duration; p50/p95/p99 are estimated from cumulative buckets
   with Prometheus `histogram_quantile`, not asserted as exact values.
 - **Milestone 12 commit:** `f18448f6519eb01f565673e54f6b02426955229b`.
+- **Milestone 13 commit:** `7b65a8573067e9417e91c1a95357b8fa0798ab94`.
 - **Milestone 13 design:** Preserve real-PostgreSQL assertions for durable state
   and allowed effects; use synchronization/fault injection rather than timing
   assumptions; retain isolated random schemas and mandatory database execution.
@@ -34,8 +37,28 @@
   PostgreSQL regression tests also cover handler/publisher exceptions, lock
   contention, competing schedulers, worker shutdown/loss, duplicate delivery and
   delayed admission.
-- **Next objective:** Await approval before starting milestone 14.
-- **Session boundary:** Do not start milestone 14 without user authorization.
+- **Milestone 14 validation:** Docker Compose validates both default and `roles`
+  configurations. The image builds to about 79 MB and runs as UID 10001 without
+  pytest, mypy, Ruff, httpx, tests, scripts or `.env`. In an isolated Compose
+  project, the explicit migration command reached revision 0009; API `/health`
+  and `/ready` returned 200; API, worker and scheduler all started and exited 0
+  on SIGTERM. `python scripts/check.py` passes Ruff, strict mypy (22 source files)
+  and all 849 tests with no skips.
+- **Next objective:** Await approval before starting milestone 15.
+- **Milestone 14 design:** Build one multi-stage Python 3.12 slim image, install
+  only the project's runtime dependencies, and run directly as the existing
+  unprivileged UID. Keep the API as the image default and use its existing module
+  CLIs for worker and scheduler roles. Compose exposes worker/scheduler only under
+  an opt-in profile so default local startup remains unchanged. Keep migrations an
+  explicit one-off command, use `/ready` for the API container healthcheck, and
+  give long-running worker/scheduler containers a stop grace period that covers
+  their configured shutdown maximum.
+- **Milestone 14 acceptance:** Build one image; verify it runs as UID 10001, has no
+  development/test dependencies or copied secrets, and starts the API, worker and
+  scheduler roles. Verify API `/health` and database-backed `/ready`, role
+  shutdown on SIGTERM within the configured grace period, and a separate explicit
+  migration command. Keep Compose's default API/database behavior unchanged.
+- **Session boundary:** Do not start milestone 15 without user authorization.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -456,15 +479,30 @@ flowchart LR
 
 ## 14 - Production containerization
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Harden the existing development image for deployable runtimes.
 - **Tasks:** One reusable image with explicit API/worker/scheduler commands, non-root
-  runtime, minimal dependencies, signal handling and appropriate probes.
-- **Design questions:** Migration job separate from replicas; CPU/memory limits,
-  Python version and image reproducibility.
-- **Acceptance:** Built images run the three relevant roles and stop correctly without
-  shipping development dependencies or secrets.
-- **Validation:** Image build, runtime/probe/shutdown smoke and configuration inspection.
+  runtime, minimal dependencies, signal handling and appropriate probes. Preserve
+  the current default `db` and `api` Compose services; add opt-in worker/scheduler
+  roles for local runtime validation.
+- **Design:** Python 3.12 slim runtime in a multi-stage build; do not add a dependency
+  manager or lockfile solely for the image. Install the package's production
+  dependencies from `pyproject.toml`, and rely on the built OCI image as the
+  deployment artifact. Run the process directly as UID 10001 so Docker signals
+  reach Uvicorn/async role CLIs. API liveness is `/health`, readiness is `/ready`;
+  worker and scheduler remain non-HTTP processes. Apply migrations only through an
+  explicit one-off command, never at replica startup.
+- **Acceptance:** One image runs API, worker and scheduler as UID 10001, contains no
+  development/test packages or source-tree secrets, reports healthy API liveness
+  and database readiness, and exits cleanly on SIGTERM within its configured
+  Compose grace period. Migration remains an explicit one-off operation, and the
+  default Compose startup remains `db` plus `api`.
+- **Validation:** Default and opt-in Compose configurations validate; the
+  multi-stage image builds and runtime inspection confirms UID 10001, no dev/test
+  packages and no copied secrets/test files. In an isolated Compose project,
+  migration completed to 0009, API `/health` and `/ready` passed, and API, worker
+  and scheduler all stopped with exit code 0 on SIGTERM. Standard checks passed:
+  Ruff, strict mypy and 849 tests without skips.
 
 ## 15 - Terraform and GCP deployment
 

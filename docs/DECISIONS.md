@@ -778,3 +778,42 @@ scrapable in this milestone. Histogram quantiles are approximate, bucket-bound
 estimates, not exact per-event percentiles. Logs deliberately omit payloads,
 arbitrary exception text and secrets, so detailed debugging must use sanitized
 error codes and persisted attempt state.
+
+## D017 - One non-root multi-role runtime image
+
+**Date:** 2026-10-09
+
+**Status:** Accepted
+
+**Decision:** Build a single multi-stage Python 3.12 slim image that installs the
+runtime project dependencies and runs directly as UID 10001. The default process
+is the API; worker and scheduler use their existing Python module CLIs in the same
+image. Keep the default local Compose services unchanged and expose long-running
+worker/scheduler services only through an opt-in profile. Probe API readiness at
+`/ready`; retain `/health` as dependency-independent liveness. Run Alembic as an
+explicit one-off command before starting application roles, never automatically
+inside replica startup.
+
+**Context:** API, worker and scheduler already have portable entry points and
+signal-aware shutdown. The existing API exposes separate liveness and readiness
+endpoints, but Compose had no HTTP probe and the image installed its package in
+the same stage that became runtime.
+
+**Alternatives:** Build separate role images; run migrations from each replica;
+use a shell entrypoint that obscures signal delivery; run polling roles in the
+default development Compose startup; add a dependency manager and lockfile only
+for this container milestone.
+
+**Reasoning:** One artifact keeps Python/runtime dependencies consistent across
+roles. A builder stage avoids carrying build-only files and dev/test dependencies
+into the final image. Direct exec-form commands let Uvicorn and the async CLIs
+receive SIGTERM as PID 1. Explicit migration execution avoids startup races and
+ambiguous failure ownership. The opt-in role profile allows lifecycle validation
+without changing the existing local default.
+
+**Consequences:** The project dependency ranges remain the source of runtime
+dependency constraints; image builds resolve compatible versions at build time,
+so rebuilds are not guaranteed to be byte-for-byte identical. A built OCI image
+is the deployment artifact and its digest identifies the exact resolved image.
+Compose grants worker/scheduler up to 65 seconds to stop, matching the configured
+60-second maximum drain plus margin. Non-HTTP roles have no HTTP healthcheck.
