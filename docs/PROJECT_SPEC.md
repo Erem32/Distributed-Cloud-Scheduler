@@ -26,7 +26,8 @@ the intended completed system unless explicitly identified as a foundation.
 | Quality | pytest, Ruff, mypy, one standard verification command |
 | Operations | Structured logging, useful metrics, reproducible load/failure experiments |
 
-Load-testing and metrics tools will be chosen when their requirements are clear.
+Local metrics use Prometheus text exposition; cloud collection and load-testing
+tools will be selected when their deployment/experiment requirements are clear.
 Changes to a major framework, database, transport, cloud, or orchestration
 platform require an explicit recorded justification.
 
@@ -94,7 +95,9 @@ service IAM and authenticated Pub/Sub push. Local emulator delivery cannot valid
   delivery, with explicit acknowledgement and failure behavior.
 - **Scheduler:** discover due jobs safely across restarts and multiple instances.
 - **Operations:** configuration, container entry points, infrastructure, CI,
-  logs/metrics, and reproducible experiments.
+  redacted structured lifecycle logs, bounded-cardinality metrics, and
+  reproducible experiments. Local scrape metrics are process-local; fleet
+  aggregation/export is a deployment-stage concern.
 
 ## Core capabilities and interfaces
 
@@ -141,6 +144,7 @@ The eventual public API includes:
 | `POST /jobs/{id}/retry` | Retry an eligible failed/dead-lettered job |
 | `GET /health` | Process liveness without depending on the database |
 | `GET /ready` | Readiness of required dependencies |
+| `GET /metrics` | Process-local Prometheus exposition for the API and push service |
 
 Implement interfaces incrementally. Early job submission may only persist data.
 Submission identity follows D011: matching validated content under a global key

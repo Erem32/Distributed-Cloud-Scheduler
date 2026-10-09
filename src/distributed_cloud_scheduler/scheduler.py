@@ -16,6 +16,7 @@ from distributed_cloud_scheduler.__main__ import create_event_loop
 from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.jobs import Job, JobStatus
+from distributed_cloud_scheduler.observability import log_event
 from distributed_cloud_scheduler.outbox import DispatchOutbox
 from distributed_cloud_scheduler.priority import priority_rank
 
@@ -26,6 +27,7 @@ async def schedule_due(database: Database, limit: int = 100) -> int:
     """Atomically admit one priority/age-ranked due batch under PostgreSQL locks."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be an integer between 1 and 1000")
+    admitted_jobs: list[tuple[str, str]] = []
     async with database.session_factory() as session, session.begin():
         cutoff = cast(datetime, await session.scalar(select(func.clock_timestamp())))
         jobs = list(await session.scalars(
@@ -37,10 +39,19 @@ async def schedule_due(database: Database, limit: int = 100) -> int:
         ))
         for job in jobs:
             job.status = JobStatus.PENDING
+            admitted_jobs.append((str(job.id), job.type))
             session.add(
                 DispatchOutbox(job_id=job.id, generation=job.generation, available_at=cutoff)
             )
         await session.flush()
+    for job_id, task_type in admitted_jobs:
+        log_event(
+            "scheduled_job_admitted",
+            "scheduler",
+            job_id=job_id,
+            task_type=task_type,
+            status="PENDING",
+        )
     return len(jobs)
 
 

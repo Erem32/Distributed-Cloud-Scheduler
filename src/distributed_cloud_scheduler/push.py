@@ -22,6 +22,7 @@ from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.execution import claim_job, recover_expired
 from distributed_cloud_scheduler.jobs import JobStatus, get_job
+from distributed_cloud_scheduler.observability import install_http_metrics, metrics_response
 from distributed_cloud_scheduler.pubsub_config import PubSubSettings
 from distributed_cloud_scheduler.worker import execute_claim
 
@@ -122,10 +123,16 @@ def create_push_app(
             await database.dispose()
 
     app = FastAPI(title="Distributed Cloud Task Scheduler Push Worker", lifespan=lifespan)
+    install_http_metrics(app, "push_worker")
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> Response:
+        """Expose this push worker process's bounded Prometheus metrics."""
+        return metrics_response()
 
     @app.get("/ready", responses={503: {"description": "Database is unavailable."}})
     async def ready(response: Response) -> dict[str, str]:
@@ -205,11 +212,14 @@ def create_push_app(
                     database,
                     job_id=job_id,
                     retry_policy=configured.execution_retry_policy,
+                    service="push_worker",
                 )
                 claim = await claim_job(database, job_id, configured.worker_lease_seconds)
                 if claim is None:
                     return await _unclaimed_response(database, job_id)
-                if not await execute_claim(database, claim, configured):
+                if not await execute_claim(
+                    database, claim, configured, service="push_worker"
+                ):
                     raise HTTPException(status_code=503, detail="Execution ownership lost")
                 return Response(status_code=204)
         except TimeoutError:

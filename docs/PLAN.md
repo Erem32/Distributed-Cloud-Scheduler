@@ -1,13 +1,22 @@
 # Project status
 
-- **Current milestone:** 11 - priority scheduling (COMPLETE).
-- **Current state:** Milestones 0-11 pass their local acceptance criteria.
-  PostgreSQL 17/emulator are healthy; revision 0009 has no host/container schema
-  drift. The standard Python 3.13.1 checks pass all 842 tests without skips;
-  Windows and Linux priority delivery smokes pass.
-- **Next objective:** After authorization, design milestone 12's structured logs,
-  metric meanings, correlation and redaction boundaries.
-- **Session boundary:** Milestone 11 is complete; ask before starting milestone 12.
+- **Current milestone:** 12 - observability (COMPLETE).
+- **Current state:** Milestones 0-12 pass their local acceptance criteria.
+  On Python 3.13.1, `python scripts/check.py` passes Ruff, strict mypy (22 source
+  files), and all 849 tests without skips. PostgreSQL is at revision 0009 and
+  `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
+  PostgreSQL 17 and the emulator are healthy.
+- **Milestone 12 design:** Emit one-line JSON lifecycle events with an allowlisted
+  field set and job ID correlation across API submission/retry, scheduler
+  admission, dispatch and execution. Never log payloads, headers, idempotency
+  keys, database URLs, ownership tokens or arbitrary exception text. Expose
+  dependency-free Prometheus text metrics at `/metrics` in the API and push HTTP
+  services; metrics are process-local, and only finite service/outcome/route/status
+  labels are permitted. Histograms record HTTP request latency and each handler
+  attempt's execution duration; p50/p95/p99 are estimated from cumulative buckets
+  with Prometheus `histogram_quantile`, not asserted as exact values.
+- **Next objective:** Milestone 13 - integration and failure testing.
+- **Session boundary:** Milestone 12 is committed; ask before starting milestone 13.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -35,6 +44,12 @@ polling and publication give each priority level five seconds of preference;
 eligibility-based aging limits fresh urgent arrivals' head start to 45 seconds.
 ID delivery stays specific and due/ownership gates remain authoritative. The API runs
 on Windows or in a non-root Python 3.12 container. GCP has no role in local startup.
+Milestone 12 emits allowlisted, one-line JSON lifecycle events correlated by job ID.
+The API and push service expose process-local Prometheus text at `/metrics`, with
+bounded service/outcome/route/status labels, counters, an active execution gauge and
+request/handler histograms. Worker recovery events have no fabricated handler duration.
+The CLI worker/dispatcher/scheduler metrics remain in-process and are not remotely
+scrapeable; fleet aggregation and cloud collection are deployment work.
 
 The publisher boundary and ID-specific execution path are exercised by real
 PostgreSQL tests and live Google SDK/emulator HTTP delivery smokes on Windows and
@@ -373,15 +388,31 @@ flowchart LR
 
 ## 12 - Observability
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Explain job outcomes and latency with useful evidence.
-- **Tasks:** Structured logs with job/type/service/attempt/status/duration/error context;
-  counters, active execution, retry/dead-letter counts and latency histograms.
-- **Design questions:** Cloud-appropriate exporters, label cardinality, payload/secret
-  redaction, process-local vs fleet metrics.
-- **Acceptance:** A job can be followed across submission, dispatch and attempts;
-  p50/p95/p99 and error/throughput measures have defined meanings.
-- **Validation:** Logging/redaction tests, metric invariants and sample end-to-end traces.
+- **Tasks:** Emit allowlisted one-line JSON lifecycle events correlated by job ID;
+  provide process-local Prometheus exposition for HTTP services; count submissions,
+  dispatch outcomes, attempts, retries and dead letters; track active executions;
+  histogram HTTP and handler-attempt latency with bounded labels.
+- **Design:** D016 defines event fields, redaction, metric names/semantics,
+  histogram buckets and process-local scope. Cloud aggregation/export remains
+  deployment work; the API and push worker expose `/metrics`.
+- **Acceptance:** Tests prove lifecycle events carry job ID/service/type/attempt/
+  status/duration/error-code context without payload, secret, token or exception
+  leakage; a created job can be correlated across submission, dispatch and attempt
+  events. Metric counters/gauges/histograms reconcile against controlled events,
+  labels remain bounded, and `/metrics` returns valid Prometheus text. Document
+  throughput as counter rate, error/dead-letter ratios by completed attempts, and
+  p50/p95/p99 as bucket-based estimates for request and handler-attempt duration.
+- **Validation:** Observability unit tests cover JSON allowlisting, metric
+  counter/gauge/histogram reconciliation, bounded labels and API/push `/metrics`.
+  Real PostgreSQL tests correlate a created job across API, dispatcher and worker
+  logs and verify expired-owner recovery counters without inventing duration data.
+  `python scripts/check.py` passes Ruff, strict mypy for 22 source files and all
+  849 tests without skips (136.20 seconds). `alembic current` is 0009 and
+  `alembic check` reports no drift. The Windows live Pub/Sub SDK/emulator/push smoke
+  passes, including retry, dead-letter, recovery, scheduling and priority scenarios.
+  PostgreSQL 17 and the Pub/Sub emulator remained healthy.
 
 ## 13 - Integration and failure testing
 
@@ -469,7 +500,7 @@ flowchart LR
   based on sleep or network-bound work.
 - **Validation:** Cross-language result comparisons and repeated controlled benchmarks.
 
-# Current milestone details
+# Recent milestone details
 
 Milestone 11 implements D015: immutable strict priority 0..9, default 0, with a
 fixed five-second head start per level. Database selectors rank eligible UTC time
@@ -531,6 +562,37 @@ API idempotency at milestone 7 does not defer safe worker ownership from milesto
 Failure/concurrency tests begin with the relevant implementation; milestone 13 extends
 them and does not postpone correctness testing.
 
+## Milestone 12 observability
+
+D016 is implemented without new runtime dependencies or schema changes. API
+submission/replay/manual-retry, scheduler admission, dispatcher finalization,
+execution outcomes and expired-owner recovery emit one-line JSON events with
+canonical job UUID correlation and allowlisted context. Payloads, headers,
+idempotency keys, database URLs, ownership tokens and arbitrary exception text
+are excluded.
+
+The API and push worker expose `/metrics`; counters distinguish created/replayed
+submissions, accepted/failed dispatch finalizations, committed attempt outcomes,
+retry/dead-letter transitions and HTTP requests. `active_executions` is a
+process-local gauge. HTTP and handler-attempt histograms use fixed finite buckets;
+handler duration excludes claim/outcome persistence, and expired-owner recovery
+does not invent a duration. Metric labels are restricted to finite service,
+outcome, route-template and HTTP-status vocabularies. Pure ASGI instrumentation
+preserves push cancellation cleanup. Process-local CLI metrics are not remotely
+scrapeable, and no fleet or cloud exporter is claimed.
+
+Verification on 2026-10-09:
+
+- `python scripts/check.py`: Ruff and strict mypy pass; 849 tests pass without
+  skips. The unit suite checks JSON field allowlisting/redaction, bounded labels,
+  metric reconciliation and API/push exposition.
+- Real PostgreSQL tests correlate API -> dispatcher -> worker events by job ID;
+  expired-owner recovery increments committed retry metrics without adding a
+  synthetic duration sample. Push cancellation still commits RETRY_WAIT.
+- `alembic current` reports 0009; `alembic check` reports no schema drift.
+- The Windows Pub/Sub SDK/emulator/push smoke passes its end-to-end retry,
+  recovery, scheduling and priority scenarios. No cloud collection was tested.
+
 # Decisions affecting upcoming work
 
 - D001: staged local-first implementation and the specified stack.
@@ -547,15 +609,19 @@ them and does not postpone correctness testing.
 - D013: explicit dead-letter exhaustion, generation-fenced manual recovery and retained history.
 - D014: durable scheduled admission, database-clock eligibility and compatible schedule identity.
 - D015: bounded priority preference, eligibility-episode aging and unchanged ID authority.
+- D016: redacted lifecycle logs, bounded Prometheus metrics and process-local scope.
 
 # Risks / technical debt
 
-- Milestones 0-11's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
+- Milestones 0-12's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
   deployment-stage validation, not evidence supplied by the emulator.
 - No cloud environment or spending authorization has been established. Cloud rollout
   must not be claimed validated from local tests.
 - Cloud IAM, broker DLQ operations and dispatcher/scheduler hosting still need
   deployment/reliability decisions. Priority cannot impose global broker execution order.
+- Metrics are process-local; API/push expose scrape endpoints, but CLI-only metrics
+  lack remote exposition. Fleet collection/export, retention and alerting remain
+  deployment work.
 - `LocalQueue` loses buffered messages on process exit. The outbox is durable, but
   marking acceptance requires a transport whose acceptance guarantees fit deployment.
   A dispatcher must be invoked to publish/replay obligations; local tests do not
@@ -582,6 +648,5 @@ them and does not postpone correctness testing.
 
 # Next actions
 
-1. Ask whether to start milestone 12; do not implement it before authorization.
-2. If authorized, define correlation/log redaction and metric meanings before behavior.
-3. Keep cloud hosting/DLQ/IAM in milestone 15; benchmark query costs at milestone 17.
+1. Ask whether to start milestone 13; do not begin it without authorization.
+2. Keep cloud hosting/DLQ/IAM in milestone 15; benchmark query costs at milestone 17.

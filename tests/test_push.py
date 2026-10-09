@@ -107,7 +107,11 @@ async def test_validated_id_and_transport_metadata(
     }
     assert (await push_client.post("/pubsub/push", json=body)).status_code == 204
     assert claim.await_args.args[1:] == (JOB_ID, 60)
-    assert recover.await_args.kwargs == {"job_id": JOB_ID, "retry_policy": RetryPolicy()}
+    assert recover.await_args.kwargs == {
+        "job_id": JOB_ID,
+        "retry_policy": RetryPolicy(),
+        "service": "push_worker",
+    }
 
 
 INVALID_ENVELOPES: list[object] = [

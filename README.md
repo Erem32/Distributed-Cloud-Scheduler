@@ -123,6 +123,7 @@ and deployment follow later milestones.
 | `GET /jobs` | `{items, limit, offset}`; newest first with a UUID tie-breaker |
 | `GET /health` | `200 {"status":"ok"}` without querying dependencies |
 | `GET /ready` | `200 {"status":"ready"}` after a query; otherwise sanitized `503 {"status":"not_ready"}` |
+| `GET /metrics` | Process-local Prometheus scrape data on the API and push worker |
 | `GET /docs` | Swagger/OpenAPI interface |
 
 Example submission and inspection in PowerShell:
@@ -623,6 +624,56 @@ application database and requires a separate name ending in `_test`.
 To stop just the optional broker, use
 `docker compose -f compose.yaml -f compose.pubsub.yaml stop pubsub`.
 Emulator data is temporary and it does not validate IAM or production delivery guarantees.
+
+## Observability
+
+The API and Pub/Sub push worker expose a process-local Prometheus scrape endpoint
+at `GET /metrics`. Lifecycle events are emitted as one-line JSON to standard
+output and use the canonical job UUID to correlate API submission, scheduler
+admission, outbox publication and execution attempts. For example:
+
+```json
+{"event":"job_attempt_completed","service":"worker","job_id":"12345678-1234-5678-9abc-123456789abc","task_type":"calculation","attempt":1,"status":"SUCCEEDED","duration_seconds":0.00012}
+```
+
+The event field set is allowlisted. Job payloads/results, request headers,
+idempotency keys, database URLs, ownership tokens and arbitrary exception text
+are never logged. Classified `error_code` values are safe identifiers, not
+exception messages.
+
+Metrics include submission and dispatch outcome counters, committed attempt
+(including expired-owner recovery), retry and dead-letter counters, active
+execution gauge, and HTTP/handler duration
+histograms. Metric labels use only bounded service names, outcome names, route
+templates and HTTP status codes. They never include job IDs or user-supplied task
+types. Histogram buckets support approximate percentile queries; for example,
+Prometheus can estimate the 95th percentile handler duration over five minutes:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, service) (rate(job_attempt_duration_seconds_bucket[5m]))
+)
+```
+
+Throughput is the rate of the corresponding counter over the chosen window;
+attempt error rate counts terminal `FAILED` and `DEAD_LETTERED` outcomes divided
+by all committed attempt outcomes. Percentiles are bucket-based estimates, not
+exact per-job values. Estimate p50 or p99 by using `0.50` or `0.99` in place of
+`0.95`. Attempts per second and the terminal error fraction can be queried as:
+
+```promql
+sum(rate(job_attempts_total[5m]))
+
+sum(rate(job_attempts_total{outcome=~"failed|dead_lettered"}[5m]))
+/
+sum(rate(job_attempts_total[5m]))
+```
+
+Metrics exist only in the process that recorded them:
+`/metrics` does not combine replicas, and CLI-only worker/dispatcher/scheduler
+process metrics are not remotely scrapeable yet. Cloud collection, fleet
+aggregation, retention and alerting remain deployment work.
 
 ## Verification
 

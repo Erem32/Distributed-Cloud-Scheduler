@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import logging
 import signal
+from time import perf_counter
 from types import FrameType
+from typing import Literal
 
 from pydantic import JsonValue
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -19,15 +21,24 @@ from distributed_cloud_scheduler.execution import (
     complete_claim,
     recover_expired,
 )
+from distributed_cloud_scheduler.observability import METRICS, Service, log_event
 from distributed_cloud_scheduler.tasks import TaskError, execute_task
 
 logger = logging.getLogger(__name__)
 
 
-async def execute_claim(database: Database, claim: Claim, settings: Settings) -> bool:
+async def execute_claim(
+    database: Database,
+    claim: Claim,
+    settings: Settings,
+    *,
+    service: Literal["worker", "push_worker"] = "worker",
+) -> bool:
     """Execute outside a DB transaction, then commit only for this live owner."""
     result: dict[str, JsonValue] | None = None
     error: dict[str, JsonValue] | None = None
+    started = perf_counter()
+    METRICS.adjust_active(service, 1)
     try:
         execution_timeout = asyncio.timeout(settings.worker_task_timeout_seconds)
         try:
@@ -43,26 +54,71 @@ async def execute_claim(database: Database, claim: Claim, settings: Settings) ->
         except Exception:
             # An unexpected handler error must not expose its text or submitted data.
             error = {"code": "internal_error", "retryable": True}
-        return await complete_claim(
+        duration = perf_counter() - started
+        committed = await complete_claim(
             database,
             claim,
             result=result,
             error=error,
             retry_policy=settings.execution_retry_policy,
         )
+        if committed:
+            _record_attempt(claim, service, result, error, duration)
+        return committed
     except asyncio.CancelledError:
+        duration = perf_counter() - started
         try:
             async with asyncio.timeout(settings.database_connect_timeout_seconds + 1):
-                await complete_claim(
+                committed = await complete_claim(
                     database,
                     claim,
                     error={"code": "cancelled", "retryable": True},
                     retry_policy=settings.execution_retry_policy,
                 )
+            if committed:
+                _record_attempt(
+                    claim, service, None, {"code": "cancelled", "retryable": True}, duration
+                )
         except (SQLAlchemyError, OSError, TimeoutError, asyncio.CancelledError):
             # If cleanup cannot reach PostgreSQL, lease recovery handles the lost owner.
             pass
         raise
+    finally:
+        METRICS.adjust_active(service, -1)
+
+
+def _record_attempt(
+    claim: Claim,
+    service: Service,
+    result: dict[str, JsonValue] | None,
+    error: dict[str, JsonValue] | None,
+    duration: float,
+) -> None:
+    """Record only outcomes committed by the current fenced owner."""
+    if result is not None:
+        status = "SUCCEEDED"
+    elif error is not None and error.get("retryable") is True:
+        status = "RETRY_WAIT" if claim.attempt_count < claim.max_attempts else "DEAD_LETTERED"
+    else:
+        status = "FAILED"
+    outcome = status.lower()
+    METRICS.increment("job_attempts_total", service=service, outcome=outcome)
+    METRICS.observe("job_attempt_duration_seconds", duration, service=service)
+    if status == "RETRY_WAIT":
+        METRICS.increment("job_retries_total", service=service)
+    elif status == "DEAD_LETTERED":
+        METRICS.increment("job_dead_lettered_total", service=service)
+    code = error.get("code") if error is not None else None
+    log_event(
+        "job_attempt_completed",
+        service,
+        job_id=str(claim.id),
+        task_type=claim.type,
+        attempt=claim.attempt_count,
+        status=status,
+        duration_seconds=duration,
+        error_code=code if isinstance(code, str) else None,
+    )
 
 
 async def run_once(

@@ -112,6 +112,7 @@ class DispatchClaim:
     token: UUID
     attempt_count: int
     generation: int = 0
+    task_type: str = "unknown"
 
 
 async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClaim | None:
@@ -149,7 +150,7 @@ async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClai
                 return None
             job = (
                 await session.execute(
-                    select(Job.status, Job.generation).where(Job.id == row.job_id)
+                    select(Job.status, Job.generation, Job.type).where(Job.id == row.job_id)
                 )
             ).one()
             if job.generation != row.generation or job.status in (
@@ -169,7 +170,7 @@ async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClai
             row.publish_attempt_count += 1
             await session.flush()
             claim = DispatchClaim(
-                row.id, row.job_id, token, row.publish_attempt_count, row.generation
+                row.id, row.job_id, token, row.publish_attempt_count, row.generation, job.type
             )
             break
         else:

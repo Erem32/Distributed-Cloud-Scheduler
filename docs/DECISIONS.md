@@ -724,3 +724,57 @@ running tasks are never preempted. This does not establish global execution orde
 resource isolation, tenant fairness or exactly-once effects. The fixed priority
 range/quantum and rank indexes form one policy; changing them requires coordinated
 schema/design work. No new dependency, cloud resource or hosting policy is introduced.
+
+## D016 - Bounded local observability and redacted lifecycle events
+
+**Date:** 2026-10-09
+
+**Status:** Accepted
+
+**Decision:** Emit lifecycle events as one-line JSON with a fixed allowlist of
+fields: event, service, job ID, task type, attempt, status, duration in seconds
+and sanitized error code where applicable. Correlate submission, scheduler
+admission, dispatch and attempt events by canonical job UUID. Do not log submitted
+payloads, HTTP headers, idempotency keys, database URLs, ownership tokens or
+arbitrary exception text. Expose `/metrics` in the API and push HTTP applications
+using Prometheus text exposition and in-process counters, gauges and cumulative
+histograms. Metric labels are limited to finite service/outcome/route/status
+vocabularies; never label by job ID, task type, exception, or other user input.
+
+Define `jobs_submitted_total` as submission requests, separating created jobs
+from replays; `dispatches_total` as completed publisher attempts
+partitioned by accepted/failed; `job_attempts_total` as fenced, durably committed
+execution outcomes, including expired-owner recovery; `job_retries_total` and
+`job_dead_lettered_total` as committed transitions; `active_executions` as
+execution claims currently being processed, including outcome persistence; and
+`http_requests_total`/`http_request_duration_seconds` by route template and status.
+`job_attempt_duration_seconds` measures handler wall time, excluding claim and
+outcome-transaction time, and is observed only after a fenced outcome commits.
+Histogram quantiles are estimated from documented cumulative buckets using
+Prometheus `histogram_quantile`; throughput is a rate of counters over a selected
+window and error/dead-letter rates use completed attempt outcomes as their
+denominator.
+
+**Context:** Job payloads and several request fields are caller-controlled or
+sensitive. Unbounded metric labels can multiply time-series storage. Existing
+runtimes include separate API, polling worker, dispatcher, scheduler and push
+processes; no fleet-wide collector or cloud monitoring resource exists yet.
+
+**Alternatives:** Log raw request/exception objects; put UUIDs or task types in
+metric labels; add a vendor SDK/exporter now; claim globally aggregated metrics
+from process-local state.
+
+**Reasoning:** JSON logs provide portable Cloud Logging ingestion while remaining
+easy to inspect locally. Prometheus text is a simple scrape contract with no new
+runtime dependency. Explicit label and redaction boundaries protect cardinality
+and data exposure. Counters remain honest about each process's observations.
+
+**Consequences:** `/metrics` reports only the current process and does not combine
+replicas or provide durable history; fleet aggregation, hosted collection,
+retention/alerting and cloud export are deferred to deployment. API and push HTTP
+services expose the scrape endpoint. CLI worker/dispatcher/scheduler lifecycle
+events still go to structured logs; their in-memory metrics are not remotely
+scrapable in this milestone. Histogram quantiles are approximate, bucket-bound
+estimates, not exact per-event percentiles. Logs deliberately omit payloads,
+arbitrary exception text and secrets, so detailed debugging must use sanitized
+error codes and persisted attempt state.

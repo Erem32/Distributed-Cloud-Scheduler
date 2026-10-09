@@ -1,6 +1,7 @@
 """Job-ID transport uses the existing PostgreSQL ownership and execution rules."""
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -18,9 +19,11 @@ from distributed_cloud_scheduler.api import create_app
 from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.dispatcher import dispatch_once
-from distributed_cloud_scheduler.execution import Claim, claim_job, claim_pending
+from distributed_cloud_scheduler.execution import Claim, claim_job, claim_pending, recover_expired
 from distributed_cloud_scheduler.jobs import Job, JobCreate, JobStatus, create_job
 from distributed_cloud_scheduler.messaging import LocalQueue
+from distributed_cloud_scheduler.observability import METRICS
+from distributed_cloud_scheduler.retries import RetryPolicy
 
 
 @pytest_asyncio.fixture
@@ -60,10 +63,18 @@ async def receive(queue: LocalQueue) -> UUID:
         return await queue.receive()
 
 
+def metric_value(rendered: str, sample_name: str) -> int:
+    for line in rendered.splitlines():
+        if line.startswith(sample_name + " "):
+            return int(line.rsplit(" ", maxsplit=1)[1])
+    return 0
+
+
 @pytest.mark.asyncio
 async def test_api_outbox_local_delivery_executes_persisted_job(
-    delivery_database: Database,
+    delivery_database: Database, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level("INFO", logger="distributed_cloud_scheduler.lifecycle")
     settings = settings_for(delivery_database)
     queue = LocalQueue()
     app = create_app(settings)
@@ -102,6 +113,70 @@ async def test_api_outbox_local_delivery_executes_persisted_job(
             assert completed["attempt_count"] == 1
             assert completed["result_metadata"] == {"sum": 6}
             assert completed["error_info"] is None
+
+    events = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "distributed_cloud_scheduler.lifecycle"
+    ]
+    job_events = [event for event in events if event.get("job_id") == str(job_id)]
+    assert [event["event"] for event in job_events] == [
+        "job_submission_created",
+        "job_dispatch_completed",
+        "job_attempt_completed",
+    ]
+    assert [event["service"] for event in job_events] == ["api", "dispatcher", "worker"]
+    assert all(event["task_type"] == "calculation" for event in job_events)
+    assert job_events[-1]["status"] == "SUCCEEDED"
+    assert job_events[-1]["attempt"] == 1
+    metrics = METRICS.render()
+    assert 'dispatches_total{outcome="accepted"}' in metrics
+    assert 'job_attempts_total{service="worker",outcome="succeeded"}' in metrics
+    assert 'job_attempt_duration_seconds_count{service="worker"}' in metrics
+
+
+@pytest.mark.asyncio
+async def test_expired_owner_recovery_is_counted_without_inventing_duration(
+    delivery_database: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="distributed_cloud_scheduler.lifecycle")
+    job_id = await submit(delivery_database)
+    claim = await claim_pending(delivery_database, lease_seconds=60)
+    assert claim is not None
+    async with delivery_database.session_factory() as session, session.begin():
+        await session.execute(
+            text(
+                "UPDATE jobs SET started_at = clock_timestamp() - interval '2 seconds', "
+                "lease_expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE id = :job_id"
+            ),
+            {"job_id": job_id},
+        )
+
+    before = METRICS.render()
+    assert await recover_expired(
+        delivery_database, retry_policy=RetryPolicy(1, 1)
+    ) == 1
+    recovered = await read_job(delivery_database, job_id)
+    assert recovered.status is JobStatus.RETRY_WAIT
+    events = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "distributed_cloud_scheduler.lifecycle"
+    ]
+    event = next(item for item in events if item.get("job_id") == str(job_id))
+    assert event["event"] == "job_attempt_recovered"
+    assert event["status"] == "RETRY_WAIT"
+    assert event["error_code"] == "worker_lost"
+    assert "duration_seconds" not in event
+
+    after = METRICS.render()
+    attempt_metric = 'job_attempts_total{service="worker",outcome="retry_wait"}'
+    retry_metric = 'job_retries_total{service="worker"}'
+    duration_metric = 'job_attempt_duration_seconds_count{service="worker"}'
+    assert metric_value(after, attempt_metric) - metric_value(before, attempt_metric) == 1
+    assert metric_value(after, retry_metric) - metric_value(before, retry_metric) == 1
+    assert metric_value(after, duration_metric) - metric_value(before, duration_metric) == 0
 
 
 @pytest.mark.asyncio

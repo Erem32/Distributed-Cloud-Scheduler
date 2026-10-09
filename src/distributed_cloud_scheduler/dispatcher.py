@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import signal
+from time import perf_counter
 from types import FrameType
 
 from sqlalchemy.exc import OperationalError
@@ -13,6 +14,7 @@ from distributed_cloud_scheduler.__main__ import create_event_loop
 from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.messaging import Publisher
+from distributed_cloud_scheduler.observability import METRICS, log_event
 from distributed_cloud_scheduler.outbox import claim_dispatch, complete_dispatch, fail_dispatch
 from distributed_cloud_scheduler.pubsub import PubSubPublisher
 from distributed_cloud_scheduler.pubsub_config import PubSubSettings
@@ -25,6 +27,7 @@ async def dispatch_once(database: Database, publisher: Publisher, settings: Sett
     claim = await claim_dispatch(database, lease_seconds=settings.dispatch_lease_seconds)
     if claim is None:
         return False
+    started = perf_counter()
     publish_timeout = asyncio.timeout(settings.dispatch_publish_timeout_seconds)
     try:
         async with publish_timeout:
@@ -36,14 +39,39 @@ async def dispatch_once(database: Database, publisher: Publisher, settings: Sett
         error_code = "publisher_unavailable"
     else:
         # A crash here replays publication after lease expiry. Duplicates are expected.
-        await complete_dispatch(database, claim)
+        committed = await complete_dispatch(database, claim)
+        if committed:
+            duration = perf_counter() - started
+            METRICS.increment("dispatches_total", outcome="accepted")
+            log_event(
+                "job_dispatch_completed",
+                "dispatcher",
+                job_id=str(claim.job_id),
+                task_type=claim.task_type,
+                attempt=claim.attempt_count,
+                status="PUBLISHED",
+                duration_seconds=duration,
+            )
         return True
 
     delay = min(
         settings.dispatch_retry_base_seconds * 2 ** min(claim.attempt_count - 1, 16),
         settings.dispatch_retry_max_seconds,
     )
-    await fail_dispatch(database, claim, delay_seconds=delay, error_code=error_code)
+    committed = await fail_dispatch(database, claim, delay_seconds=delay, error_code=error_code)
+    if committed:
+        duration = perf_counter() - started
+        METRICS.increment("dispatches_total", outcome="failed")
+        log_event(
+            "job_dispatch_completed",
+            "dispatcher",
+            job_id=str(claim.job_id),
+            task_type=claim.task_type,
+            attempt=claim.attempt_count,
+            status="READY",
+            duration_seconds=duration,
+            error_code=error_code,
+        )
     return True
 
 

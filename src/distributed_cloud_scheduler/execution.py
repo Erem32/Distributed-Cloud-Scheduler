@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import JsonValue
@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from distributed_cloud_scheduler.attempts import AttemptStatus, JobAttempt
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.jobs import Job, JobStatus, validate_json_object
+from distributed_cloud_scheduler.observability import METRICS, log_event
 from distributed_cloud_scheduler.outbox import DispatchOutbox
 from distributed_cloud_scheduler.priority import priority_rank
 from distributed_cloud_scheduler.retries import RetryPolicy
@@ -29,6 +30,7 @@ class Claim:
     attempt_count: int
     token: UUID
     generation: int = 0
+    max_attempts: int = 3
 
 
 async def claim_pending(database: Database, lease_seconds: int) -> Claim | None:
@@ -95,7 +97,15 @@ async def _claim_available(
         )
         await session.flush()
         await session.refresh(job)
-        claim = Claim(job.id, job.type, job.payload, job.attempt_count, token, job.generation)
+        claim = Claim(
+            job.id,
+            job.type,
+            job.payload,
+            job.attempt_count,
+            token,
+            job.generation,
+            job.max_attempts,
+        )
     return claim
 
 
@@ -209,6 +219,7 @@ async def recover_expired(
     *,
     job_id: UUID | None = None,
     retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+    service: Literal["worker", "push_worker"] = "worker",
 ) -> int:
     """Finalize expired attempts and durably retry a bounded batch or delivered owner."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
@@ -229,6 +240,7 @@ async def recover_expired(
         )
         if not expired_jobs:
             return 0
+        recovered: list[tuple[str, str, int, JobStatus]] = []
         for job in expired_jobs:
             attempt = await _current_attempt(session, job)
             now = cast(datetime, await session.scalar(select(func.clock_timestamp())))
@@ -241,6 +253,23 @@ async def recover_expired(
                 {"code": "worker_lost", "retryable": True},
                 retry_policy,
             )
+            recovered.append((str(job.id), job.type, job.attempt_count, job.status))
         await session.flush()
         recovered_count = len(expired_jobs)
+    for recovered_id, task_type, attempt_count, status in recovered:
+        outcome = status.value.lower()
+        METRICS.increment("job_attempts_total", service=service, outcome=outcome)
+        if status is JobStatus.RETRY_WAIT:
+            METRICS.increment("job_retries_total", service=service)
+        elif status is JobStatus.DEAD_LETTERED:
+            METRICS.increment("job_dead_lettered_total", service=service)
+        log_event(
+            "job_attempt_recovered",
+            service,
+            job_id=recovered_id,
+            task_type=task_type,
+            attempt=attempt_count,
+            status=status.value,
+            error_code="worker_lost",
+        )
     return recovered_count
