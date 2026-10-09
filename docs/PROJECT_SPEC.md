@@ -125,6 +125,10 @@ transport quarantine and cannot determine the authoritative database job state.
 D014 makes an original scheduled_at part of immutable submission identity.
 Scheduled intent persists until due scheduler admission atomically creates dispatch;
 early messages cannot replace admission, and database timestamps govern eligibility.
+D015 gives immutable priority a finite eligibility-based head start, with aging
+and deterministic timestamp/UUID ties across database selectors. Retry/manual
+recovery starts a fresh readiness episode. ID-specific delivery stays authoritative;
+database selection preference does not imply global broker or execution order.
 
 The eventual public API includes:
 

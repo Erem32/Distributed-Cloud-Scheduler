@@ -642,3 +642,85 @@ be later due to polling/locks/outages/dispatch/capacity, and clock changes affec
 eligibility. Original scheduling metadata has no retention/cleanup API yet; guarded
 downgrade is deliberately unavailable while it exists. Coordinated stopped-runtime
 upgrades remain required. No priority, cloud provisioning or new dependency is added.
+
+## D015 - Bounded priority preference with readiness-based aging
+
+**Date:** 2026-10-06
+
+**Status:** Accepted for milestone 11; validation evidence recorded in PLAN
+
+**Decision:** Add immutable strict integer priority 0..9, default 0. Give each level
+five seconds of preference, at most 45 seconds. Among due, unlocked candidates,
+order by eligibility timestamp in UTC minus priority * five seconds, then eligibility
+timestamp and UUID. This is linear aging with a fixed head start: older eligible
+work eventually ranks ahead of fresh highest-priority arrivals without score updates,
+process-local counters or a fairness coordinator. This replaces the date-only
+selection order in D014, while retaining all due/ownership/admission semantics.
+
+Persist one internal jobs.ready_at for the current readiness episode. Submission
+sets it to greatest(database creation time, scheduled_at), or creation time for
+immediate work. Past dates cannot fabricate age. Admission and publication retain
+it; automatic retry resets it to its persisted next_attempt_at, and manual recovery
+resets it to the current PostgreSQL time. Keep original priority, schedule, hash
+and history through all generations. The field is absent from public input/reads;
+GET /jobs remains ordered by creation time, independent of selection preference.
+
+Scheduler admission and polling execution rank jobs using ready_at. Due/status,
+attempt budgets and ownership remain independent eligibility gates. A high rank
+never advances future eligibility. ID-specific claims/push continue to claim the
+delivered eligible ID without consulting other jobs' priorities.
+
+Dispatch joins authoritative immutable Job.priority and ranks READY by available_at
+and reclaimable PUBLISHING by lease_expires_at. Publication backoff and expired
+leases start a new dispatch waiting episode, separate from execution readiness.
+Lock FOR UPDATE OF dispatch_outbox SKIP LOCKED; the join must not lock jobs or
+reverse established outbox-before-job finalization order. Keep broker IDs and
+outbox schema unchanged; no redundant priority snapshot is required.
+
+Rank in UTC explicitly before subtracting the interval. PostgreSQL timestamptz
+interval arithmetic depends on session timezone; timestamp arithmetic after
+AT TIME ZONE 'UTC' provides an immutable expression for the two partial job rank
+indexes. Match PostgreSQL's typed index representation in metadata so ordinary
+Alembic drift checks remain meaningful. Retain existing due/lease indexes for
+eligibility filtering. Dispatch's joined expression needs candidate sorting;
+query cost and tuning remain benchmark work, with no performance claim here. See
+[PostgreSQL date/time operators](https://www.postgresql.org/docs/17/functions-datetime.html)
+and [expression indexes](https://www.postgresql.org/docs/17/indexes-expressional.html).
+
+Exclude effective priority 0 from submission fingerprint content, retaining all
+earlier D011/D014 bytes for omitted or explicit defaults. Include nonzero integers
+in immutable identity; changing priority under a retained key conflicts. Migration
+0009 adds only priority/default/range, readiness and rank indexes. Backfill retry
+readiness from next_attempt_at, recovered generation readiness from its earliest
+current-generation outbox creation time, and other rows from greatest(creation,
+schedule); fall back to the initial baseline when no recovery obligation exists.
+Earlier closed attempt readiness is not reconstructed. Preserve every existing
+field, original digest, attempt and obligation. Downgrade acquires exclusive locks
+on all three tables before guarding and refuses while any nonzero priority remains,
+including completed jobs, protecting original request identity. Default-only rows
+may return to 0008; its original scheduling downgrade guard still applies.
+
+**Context:** Strict priority can starve low-priority work under sustained arrivals.
+Creation time alone gives a newly retried or manually recovered old job unearned
+age. In-memory burst counters cannot give independent replicas a shared policy.
+Pub/Sub ordering is scoped to ordering keys and is not an application-wide priority
+mechanism; see [Google's ordering contract](https://docs.cloud.google.com/pubsub/docs/ordering).
+
+**Alternatives:** Strict descending priority; original creation-time aging; mutable
+effective scores; shared fair-selection counters; priority queues/topics or broker
+ordering keys; copying priority into every outbox obligation.
+
+**Reasoning:** A fixed head start gives urgency a clear finite meaning. Readiness
+episodes keep retries and recovery honest while static ranks need no clock-dependent
+index or background updates. Reusing existing claims preserves concurrency fencing;
+the immutable join avoids copying submission data into dispatch records.
+
+**Consequences:** Continuously eligible, unlocked work older than the maximum
+head start outranks fresh urgent arrivals given advancing database time, available
+capacity and selector progress. Older backlog, locks/outages and clock adjustments
+can still delay work; no finite wall-time service guarantee follows. Concurrent
+selectors, skipped locks, publication and broker arrival/prefetch may reorder work;
+running tasks are never preempted. This does not establish global execution order,
+resource isolation, tenant fairness or exactly-once effects. The fixed priority
+range/quantum and rank indexes form one policy; changing them requires coordinated
+schema/design work. No new dependency, cloud resource or hosting policy is introduced.

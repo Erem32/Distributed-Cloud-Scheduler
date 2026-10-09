@@ -31,10 +31,13 @@ def submission_fingerprint(submission: JobCreate) -> str:
     Array order, strings, integer versus float values, and signed float zero remain
     significant. This hashes the validated request rather than a JSONB round trip.
     """
-    fields = submission.model_dump(mode="python", exclude={"scheduled_at"})
+    fields = submission.model_dump(mode="python", exclude={"scheduled_at", "priority"})
     # Immediate submissions retain their original D011 bytes, including existing keys.
     if submission.scheduled_at is not None:
         fields["scheduled_at"] = submission.scheduled_at.isoformat(timespec="microseconds")
+    # Effective default priority preserves all earlier immediate and scheduled digests.
+    if submission.priority != 0:
+        fields["priority"] = submission.priority
     encoded = json.dumps(
         fields,
         sort_keys=True,

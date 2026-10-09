@@ -1,4 +1,4 @@
-"""Exercise live API identity, retries, recovery, scheduling and emulator push.
+"""Exercise live API identity, retries, scheduling, priority and emulator push.
 
 Set TEST_DATABASE_URL to a separate database ending in _test and explicitly set
 PUBSUB_EMULATOR_HOST. Start the optional compose.pubsub.yaml emulator first. When
@@ -743,6 +743,186 @@ async def exercise_scheduled_delivery(
     )
 
 
+async def priority_submission(api_url: str, priority: int, scheduled_at: str | None = None) -> UUID:
+    status, created = await api_submission(
+        api_url,
+        {
+            "type": "calculation",
+            "payload": {"numbers": [20, 22]},
+            "priority": priority,
+            "scheduled_at": scheduled_at,
+        },
+    )
+    require(
+        status == 201 and created.get("priority") == priority and "ready_at" not in created,
+        "Live API did not preserve public priority while keeping readiness internal",
+    )
+    return UUID(created["id"])
+
+
+async def priority_publication(
+    database: Database,
+    api_url: str,
+    log_path: Path,
+    environment: dict[str, str],
+    expected: list[UUID],
+) -> None:
+    """Observe committed outbox selection rather than broker delivery ordering."""
+    published: set[UUID] = set()
+    for job_id in expected:
+        acknowledgements = acknowledged_pushes(log_path)
+        await runtime_once("dispatcher", environment)
+        published.add(job_id)
+        for candidate in expected:
+            row = await read_outbox(database, candidate)
+            require(
+                row.status is (
+                    DispatchStatus.PUBLISHED if candidate in published else DispatchStatus.READY
+                ),
+                "Dispatcher priority selection did not publish exactly the expected obligation",
+            )
+        completed = await wait_for_outcome(database, job_id, JobStatus.SUCCEEDED)
+        await wait_for_ack(log_path, acknowledgements + 1)
+        require(
+            completed.attempt_count == 1
+            and completed.result_metadata == {"sum": 42}
+            and len(await public_attempts(api_url, job_id)) == 1,
+            "Selected priority obligation did not complete one owned SDK/push attempt",
+        )
+
+
+async def exercise_priority_selection(
+    database: Database,
+    publisher: PubSubPublisher,
+    api_url: str,
+    log_path: Path,
+    environment: dict[str, str],
+) -> None:
+    """Prove selection and aging locally, with ID-only delivery kept authoritative."""
+    low = await priority_submission(api_url, 0)
+    medium = await priority_submission(api_url, 4)
+    high = await priority_submission(api_url, 9)
+    await priority_publication(database, api_url, log_path, environment, [high, medium, low])
+    print(
+        "PASS: live API priorities -> dispatcher CLI selects high/medium/low outbox obligations; "
+        "real SDK/push outcomes do not depend on broker delivery order",
+        flush=True,
+    )
+
+    async with database.session_factory() as session:
+        database_now = await session.scalar(select(func.clock_timestamp()))
+    require(isinstance(database_now, datetime), "Database did not return its priority clock")
+    assert isinstance(database_now, datetime)
+    past_due = (database_now - timedelta(seconds=1)).isoformat(timespec="microseconds")
+    scheduled_low = await priority_submission(api_url, 0, past_due)
+    tied_high = [await priority_submission(api_url, 9, past_due) for _ in range(2)]
+    expected = [*sorted(tied_high), scheduled_low]
+    # Give these disposable rows one equal eligibility timestamp so the live
+    # scheduler and polling runtimes must resolve a real rank/UUID tie.
+    async with database.session_factory() as session, session.begin():
+        tied_at = await session.scalar(select(func.clock_timestamp()))
+        await session.execute(
+            update(Job).where(Job.id.in_(expected)).values(ready_at=tied_at)
+        )
+    scheduler_environment = {**environment, "SCHEDULER_BATCH_SIZE": "1"}
+    admitted: set[UUID] = set()
+    for job_id in expected:
+        await runtime_once("scheduler", scheduler_environment)
+        admitted.add(job_id)
+        for candidate in expected:
+            job = await read_job(database, candidate)
+            rows = await read_outbox_rows(database, candidate)
+            require(
+                job.status is (JobStatus.PENDING if candidate in admitted else JobStatus.SCHEDULED)
+                and job.attempt_count == 0
+                and len(rows) == (1 if candidate in admitted else 0),
+                "Scheduler priority/tie selection did not atomically admit one expected job",
+            )
+    claimed: set[UUID] = set()
+    for job_id in expected:
+        await runtime_once("worker", environment)
+        claimed.add(job_id)
+        for candidate in expected:
+            job = await read_job(database, candidate)
+            require(
+                job.status is (JobStatus.SUCCEEDED if candidate in claimed else JobStatus.PENDING)
+                and job.attempt_count == (1 if candidate in claimed else 0),
+                "Polling worker priority/tie selection did not execute one expected job",
+            )
+    # Polling completed these jobs without broker delivery. The dispatcher must
+    # skip their original obligations before the next selection experiment.
+    await runtime_once("dispatcher", environment)
+    for job_id in expected:
+        row = await read_outbox(database, job_id)
+        require(
+            row.status is DispatchStatus.SKIPPED and row.publish_attempt_count == 0,
+            "Polling completion did not leave terminal priority obligations safely skippable",
+        )
+    print(
+        "PASS: scheduler batch-one admission and local worker CLI select priority then UUID ties; "
+        "completed polling obligations are skipped without publication",
+        flush=True,
+    )
+
+    high = await priority_submission(api_url, 9)
+    low = await priority_submission(api_url, 0)
+    acknowledgements = acknowledged_pushes(log_path)
+    await publisher.publish(low)
+    completed = await wait_for_outcome(database, low, JobStatus.SUCCEEDED)
+    await wait_for_ack(log_path, acknowledgements + 1)
+    require(
+        completed.attempt_count == 1
+        and (await read_job(database, high)).status is JobStatus.PENDING
+        and (await read_job(database, high)).attempt_count == 0
+        and (await read_outbox(database, high)).status is DispatchStatus.READY,
+        "A delivered low-priority ID was incorrectly gated by other jobs' priority",
+    )
+    await priority_publication(database, api_url, log_path, environment, [high])
+    await runtime_once("dispatcher", environment)
+    require(
+        (await read_outbox(database, low)).status is DispatchStatus.SKIPPED,
+        "Targeted low-ID execution left an obsolete publication obligation active",
+    )
+    print(
+        "PASS: targeted low-priority SDK ID executes while urgent work awaits dispatch; "
+        "priority remains a selection policy",
+        flush=True,
+    )
+
+    aged_low = await priority_submission(api_url, 0)
+    last_high: UUID | None = None
+    # Advance only this disposable job's eligibility age instead of waiting for
+    # a 45-second real-time head start. Fresh urgent API arrivals continue at each
+    # pass; the same low job must progress once its age exceeds the maximum boost.
+    for age in (30, 35, 40, 46):
+        async with database.session_factory() as session, session.begin():
+            aged_at = await session.scalar(select(func.clock_timestamp() - timedelta(seconds=age)))
+            await session.execute(update(Job).where(Job.id == aged_low).values(ready_at=aged_at))
+            await session.execute(
+                update(DispatchOutbox)
+                .where(DispatchOutbox.job_id == aged_low)
+                .values(available_at=aged_at)
+            )
+        last_high = await priority_submission(api_url, 9)
+        selected = aged_low if age > 45 else last_high
+        await priority_publication(database, api_url, log_path, environment, [selected])
+        waiting = last_high if age > 45 else aged_low
+        require(
+            (await read_job(database, waiting)).status is JobStatus.PENDING
+            and (await read_job(database, waiting)).attempt_count == 0
+            and (await read_outbox(database, waiting)).status is DispatchStatus.READY,
+            "A priority publication pass also consumed its unselected contender",
+        )
+    require(last_high is not None, "Priority aging probe did not submit urgent work")
+    assert last_high is not None
+    await priority_publication(database, api_url, log_path, environment, [last_high])
+    print(
+        "PASS: continuous urgent API arrivals win within their head start; controlled aged-low "
+        "work progresses beyond 45 seconds, with one owned attempt per selected ID",
+        flush=True,
+    )
+
+
 async def exercise(
     settings: Settings,
     cloud: PubSubSettings,
@@ -761,6 +941,7 @@ async def exercise(
             "payload": {"numbers": [8, 13, 21]},
             "type": "calculation",
             "scheduled_at": None,
+            "priority": 0,
         }
         status, created = await api_submission(api_url, success_submission, success_key)
         require(status == 201 and created.get("status") == "PENDING", "Keyed API create failed")
@@ -930,6 +1111,7 @@ async def exercise(
         await exercise_scheduled_delivery(
             database, publisher, settings, api_url, log_path, environment
         )
+        await exercise_priority_selection(database, publisher, api_url, log_path, environment)
 
         # Leave these jobs pending so they cannot change the fault checks' dispatch ordering.
         nested_key = f"smoke-nested:{uuid4().hex}"

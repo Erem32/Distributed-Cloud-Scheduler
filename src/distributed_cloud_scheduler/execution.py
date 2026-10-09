@@ -13,6 +13,7 @@ from distributed_cloud_scheduler.attempts import AttemptStatus, JobAttempt
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.jobs import Job, JobStatus, validate_json_object
 from distributed_cloud_scheduler.outbox import DispatchOutbox
+from distributed_cloud_scheduler.priority import priority_rank
 from distributed_cloud_scheduler.retries import RetryPolicy
 
 DEFAULT_RETRY_POLICY = RetryPolicy()
@@ -31,7 +32,7 @@ class Claim:
 
 
 async def claim_pending(database: Database, lease_seconds: int) -> Claim | None:
-    """Claim available work, including due retries, without a long execution transaction."""
+    """Claim due work by bounded priority/age preference in a short transaction."""
     return await _claim_available(database, lease_seconds)
 
 
@@ -67,7 +68,8 @@ async def _claim_available(
         if job_id is not None:
             candidates = candidates.where(Job.id == job_id)
         job = await session.scalar(
-            candidates.order_by(Job.created_at, Job.id).limit(1).with_for_update(skip_locked=True)
+            candidates.order_by(priority_rank(Job.ready_at, Job.priority), Job.ready_at, Job.id)
+            .limit(1).with_for_update(skip_locked=True)
         )
         if job is None:
             return None
@@ -172,6 +174,7 @@ def _finish_attempt(
         and job.attempt_count < job.max_attempts
     ):
         retry_at = now + timedelta(seconds=retry_policy.delay_seconds(job.attempt_count))
+        job.ready_at = retry_at
         session.add(
             DispatchOutbox(job_id=job.id, generation=job.generation, available_at=retry_at)
         )

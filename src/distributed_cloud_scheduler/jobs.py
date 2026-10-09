@@ -30,6 +30,7 @@ from distributed_cloud_scheduler.idempotency import (
     submission_fingerprint,
     validate_idempotency_key,
 )
+from distributed_cloud_scheduler.priority import MAX_PRIORITY
 
 MAX_PAYLOAD_BYTES = 64 * 1024
 _SCHEDULE_TIMESTAMP = re.compile(
@@ -62,6 +63,7 @@ class Job(Base):
         ),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload_object"),
         CheckConstraint("max_attempts BETWEEN 1 AND 20", name="max_attempts_range"),
+        CheckConstraint("priority BETWEEN 0 AND 9", name="priority_range"),
         CheckConstraint("generation >= 0", name="generation_nonnegative"),
         CheckConstraint(
             "status <> 'SCHEDULED' OR (scheduled_at IS NOT NULL AND attempt_count = 0 "
@@ -115,6 +117,23 @@ class Job(Base):
         UniqueConstraint("idempotency_key", name="uq_jobs_idempotency_key"),
         Index("ix_jobs_created_at_id", "created_at", "id"),
         Index(
+            "ix_jobs_scheduled_priority",
+            text(
+                "((ready_at AT TIME ZONE 'UTC'::text) - "
+                "priority::double precision * '00:00:05'::interval)"
+            ),
+            "ready_at", "id", postgresql_where=text("status = 'SCHEDULED'"),
+        ),
+        Index(
+            "ix_jobs_available_priority",
+            text(
+                "((ready_at AT TIME ZONE 'UTC'::text) - "
+                "priority::double precision * '00:00:05'::interval)"
+            ),
+            "ready_at", "id",
+            postgresql_where=text("status IN ('PENDING', 'QUEUED', 'RETRY_WAIT')"),
+        ),
+        Index(
             "ix_jobs_scheduled_due", "scheduled_at", "id",
             postgresql_where=text("status = 'SCHEDULED'"),
         ),
@@ -149,6 +168,12 @@ class Job(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    ready_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -218,6 +243,13 @@ class JobCreate(BaseModel):
     type: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
     payload: dict[str, JsonValue]
     max_attempts: int = Field(default=3, ge=1, le=20)
+    priority: int = Field(
+        default=0, ge=0, le=MAX_PRIORITY,
+        description=(
+            "Immutable priority: each level adds a five-second preference among eligible "
+            "database candidates; older work ages ahead. No global execution-order guarantee."
+        ),
+    )
     scheduled_at: AwareDatetime | None = Field(
         default=None,
         description=(
@@ -277,6 +309,7 @@ class JobRead(BaseModel):
     generation: int = 0
     attempt_count: int
     max_attempts: int
+    priority: int = 0
     result_metadata: dict[str, JsonValue] | None = None
     error_info: dict[str, JsonValue] | None = None
 
@@ -308,6 +341,8 @@ async def create_job(session: AsyncSession, submission: JobCreate) -> Job:
             type=submission.type,
             payload=submission.payload,
             max_attempts=submission.max_attempts,
+            priority=submission.priority,
+            ready_at=func.greatest(func.now(), submission.scheduled_at),
             scheduled_at=submission.scheduled_at,
             status=(
                 JobStatus.SCHEDULED
@@ -353,6 +388,8 @@ async def create_or_replay_job(
                 type=submission.type,
                 payload=submission.payload,
                 max_attempts=submission.max_attempts,
+                priority=submission.priority,
+                ready_at=func.greatest(func.now(), submission.scheduled_at),
                 scheduled_at=submission.scheduled_at,
                 status=(
                     JobStatus.SCHEDULED

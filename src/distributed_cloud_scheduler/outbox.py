@@ -17,6 +17,7 @@ from sqlalchemy import (
     Integer,
     String,
     and_,
+    case,
     func,
     or_,
     select,
@@ -28,6 +29,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from distributed_cloud_scheduler.database import Base, Database
 from distributed_cloud_scheduler.jobs import Job, JobStatus
+from distributed_cloud_scheduler.priority import priority_rank
 
 
 class DispatchStatus(StrEnum):
@@ -116,10 +118,15 @@ async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClai
     """Claim due publication; skip up to 100 terminal or obsolete obligations."""
     if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
         raise ValueError("lease_seconds must be a positive integer")
+    eligible_at = case(
+        (DispatchOutbox.status == DispatchStatus.PUBLISHING, DispatchOutbox.lease_expires_at),
+        else_=DispatchOutbox.available_at,
+    )
     async with database.session_factory() as session, session.begin():
         for _ in range(100):
             row = await session.scalar(
                 select(DispatchOutbox)
+                .join(Job, Job.id == DispatchOutbox.job_id)
                 .where(
                     or_(
                         and_(
@@ -132,9 +139,11 @@ async def claim_dispatch(database: Database, lease_seconds: int) -> DispatchClai
                         ),
                     )
                 )
-                .order_by(DispatchOutbox.available_at, DispatchOutbox.id)
+                .order_by(
+                    priority_rank(eligible_at, Job.priority), eligible_at, DispatchOutbox.id
+                )
                 .limit(1)
-                .with_for_update(skip_locked=True)
+                .with_for_update(of=DispatchOutbox, skip_locked=True)
             )
             if row is None:
                 return None

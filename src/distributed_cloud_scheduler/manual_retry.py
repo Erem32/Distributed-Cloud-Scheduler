@@ -60,6 +60,7 @@ async def retry_job(session: AsyncSession, job_id: UUID, expected_generation: in
         job.started_at = None
         job.finished_at = None
         job.next_attempt_at = None
+        job.ready_at = now
         job.claim_token = None
         job.lease_expires_at = None
         job.result_metadata = None

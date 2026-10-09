@@ -78,7 +78,7 @@ def test_payload_budget_counts_compact_utf8_bytes() -> None:
 
 
 @pytest.mark.parametrize(
-    "field", ["status", "attempt_count", "created_at", "priority"]
+    "field", ["status", "attempt_count", "created_at", "ready_at"]
 )
 def test_client_cannot_set_state_or_unimplemented_fields(field: str) -> None:
     with pytest.raises(ValidationError):

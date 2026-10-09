@@ -17,12 +17,13 @@ from distributed_cloud_scheduler.config import Settings
 from distributed_cloud_scheduler.database import Database
 from distributed_cloud_scheduler.jobs import Job, JobStatus
 from distributed_cloud_scheduler.outbox import DispatchOutbox
+from distributed_cloud_scheduler.priority import priority_rank
 
 logger = logging.getLogger(__name__)
 
 
 async def schedule_due(database: Database, limit: int = 100) -> int:
-    """Atomically admit one ordered batch; PostgreSQL locks replace scheduler leases."""
+    """Atomically admit one priority/age-ranked due batch under PostgreSQL locks."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be an integer between 1 and 1000")
     async with database.session_factory() as session, session.begin():
@@ -30,7 +31,7 @@ async def schedule_due(database: Database, limit: int = 100) -> int:
         jobs = list(await session.scalars(
             select(Job)
             .where(Job.status == JobStatus.SCHEDULED, Job.scheduled_at <= cutoff)
-            .order_by(Job.scheduled_at, Job.id)
+            .order_by(priority_rank(Job.ready_at, Job.priority), Job.ready_at, Job.id)
             .limit(limit)
             .with_for_update(skip_locked=True)
         ))

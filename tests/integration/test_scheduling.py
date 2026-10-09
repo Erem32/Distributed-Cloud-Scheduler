@@ -264,7 +264,7 @@ async def test_invalid_scheduled_api_input_is_sanitized_and_creates_nothing(
 
 
 @pytest.mark.asyncio
-async def test_bounded_scheduler_order_uses_date_then_uuid_and_leaves_future_rows(
+async def test_bounded_scheduler_order_uses_readiness_then_uuid_and_leaves_future_rows(
     scheduled_database: Database,
 ) -> None:
     now = await database_now(scheduled_database)
@@ -272,6 +272,18 @@ async def test_bounded_scheduler_order_uses_date_then_uuid_and_leaves_future_row
     tied = [await submit(scheduled_database, now - timedelta(hours=1)) for _ in range(3)]
     late = await submit(scheduled_database, now - timedelta(minutes=1))
     future = await submit(scheduled_database, now + timedelta(days=1))
+    # Past dates do not invent waiting age. Give the three tied submissions the
+    # same real creation/readiness instant to exercise UUID tie-breaking.
+    tied_readiness = (await read_job(scheduled_database, tied[0])).ready_at
+    async with scheduled_database.session_factory.begin() as session:
+        await session.execute(
+            text("UPDATE jobs SET ready_at = :ready_at WHERE id = ANY(:ids)"),
+            {"ready_at": tied_readiness, "ids": tied},
+        )
+    for job_id in (early, late):
+        job = await read_job(scheduled_database, job_id)
+        assert job.ready_at == job.created_at
+        assert job.scheduled_at < job.ready_at
     expected = [early, *sorted(tied), late]
     assert await schedule_due(scheduled_database, limit=2) == 2
     assert {row.job_id for row in await obligations(scheduled_database)} == set(expected[:2])

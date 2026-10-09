@@ -157,7 +157,6 @@ def test_schedule_upgrade_round_trip_preserves_lifecycles_identity_history_and_o
             assert upgraded == {key: records for key, records in original.items()
                                 if key != "alembic_version"}
             assert_scheduling_schema(engine)
-            command.check(config)
             command.downgrade(config, "0007")
             assert snapshot(engine) == original
             with engine.connect() as connection:

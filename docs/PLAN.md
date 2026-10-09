@@ -1,17 +1,17 @@
 # Project status
 
-- **Current milestone:** 10 - delayed jobs and scheduler (COMPLETE).
-- **Current state:** Milestones 0-10 pass their local acceptance criteria.
-  PostgreSQL 17/emulator are healthy; revision 0008 has no host/container schema
-  drift. The standard Python 3.13.1 checks pass all 762 tests without skips;
-  Windows and Linux scheduled delivery smokes pass.
-- **Next objective:** After authorization, design milestone 11's limited priority
-  policy, including ties, starvation and transport ordering limits.
-- **Session boundary:** Milestone 10 is complete; ask before starting milestone 11.
+- **Current milestone:** 11 - priority scheduling (COMPLETE).
+- **Current state:** Milestones 0-11 pass their local acceptance criteria.
+  PostgreSQL 17/emulator are healthy; revision 0009 has no host/container schema
+  drift. The standard Python 3.13.1 checks pass all 842 tests without skips;
+  Windows and Linux priority delivery smokes pass.
+- **Next objective:** After authorization, design milestone 12's structured logs,
+  metric meanings, correlation and redaction boundaries.
+- **Session boundary:** Milestone 11 is complete; ask before starting milestone 12.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
-- **Updated:** 2026-10-06.
+- **Updated:** 2026-10-09.
 
 This document is the implementation source of truth. PROJECT_SPEC defines the
 product; DECISIONS records significant choices. A milestone becomes COMPLETE only
@@ -29,7 +29,11 @@ the transactional dispatch outbox and backfills existing active jobs; revision
 0006 adds retry due times and attempt history; revision 0007 adds generation fencing
 and final dead-letter context; revision 0008 adds original scheduled dates and
 indexed SCHEDULED admission intent. The scheduler CLI admits bounded due batches
-using PostgreSQL locks, committing PENDING and a fresh outbox atomically. The API runs
+using PostgreSQL locks, committing PENDING and a fresh outbox atomically. Revision
+0009 adds immutable priority and internal readiness with UTC rank indexes. Scheduler,
+polling and publication give each priority level five seconds of preference;
+eligibility-based aging limits fresh urgent arrivals' head start to 45 seconds.
+ID delivery stays specific and due/ownership gates remain authoritative. The API runs
 on Windows or in a non-root Python 3.12 container. GCP has no role in local startup.
 
 The publisher boundary and ID-specific execution path are exercised by real
@@ -322,15 +326,50 @@ flowchart LR
 
 ## 11 - Priority scheduling
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Implement an honest, limited scheduling priority policy.
 - **Tasks:** Evaluate DB dispatch ordering vs broker realities; define ties and starvation
   policy, then add the minimum priority fields/indexes and ordering.
-- **Design questions:** Pub/Sub has no global execution priority guarantee; prefetch
-  and already-running tasks limit ordering.
-- **Acceptance:** The documented dispatch policy is demonstrated without promising
-  strict global execution order.
-- **Validation:** Deterministic mixed-priority/tie tests and sustained-load starvation checks.
+- **Design:** Immutable strict integer priority 0..9, default 0; higher values get
+  five seconds of head start per level, at most 45 seconds. Among due, unlocked
+  candidates order by (eligibility in UTC minus priority * five seconds), then
+  eligibility timestamp and UUID. This static rank equals linear aging without
+  timers, mutable scores or process-local counters. Continually eligible unlocked
+  work older than the maximum head start ranks ahead of fresh urgent arrivals;
+  capacity, a progressing selector and the database clock are required. No finite
+  wall-time, global execution-order, preemption or broker-priority guarantee.
+- **Acceptance:** Scheduler admission and local polling use internal jobs.ready_at.
+  Submission initializes it to greatest(database creation time, scheduled_at), or
+  creation time if immediate; past dates cannot invent age. Admission/publication
+  retain it. Automatic retry resets it to next_attempt_at; manual recovery resets
+  it to current PostgreSQL time while retaining original priority/date/hash/history.
+  Existing status, due-time, attempt budget and ownership predicates stay authoritative;
+  aging never makes a future job/retry eligible. ID-specific push/claims execute
+  their delivered eligible ID regardless of other jobs' priority.
+  Dispatch joins immutable Job.priority without locking jobs and uses available_at
+  for READY, lease_expires_at for reclaimable PUBLISHING; FOR UPDATE OF dispatch_outbox
+  SKIP LOCKED preserves outbox-before-job lock order. Publication backoff/reclaimed
+  leases start a new dispatch eligibility episode. No priority is copied into broker
+  messages or outbox rows. Equal ranks use eligibility/UUID, and locked rows may reorder.
+  Public input/reads expose priority; ready_at remains internal and caller-controlled
+  fields remain rejected. Default/omitted priority is excluded from hashing, preserving
+  every D011/D014 digest; nonzero priority participates in immutable submission identity.
+  Migration 0009 adds default-zero priority/range constraint, internal readiness and
+  partial UTC rank indexes for scheduled/available jobs; retain existing due/lease
+  indexes. Backfill readiness from retry due times, current-generation recovery outbox
+  creation time, or greatest(original creation, schedule). Preserve existing records,
+  original fingerprints, history and obligations. Default-only downgrade roundtrips;
+  lock all three tables before guarding and refuse any nonzero priority, including
+  terminal jobs, to protect original submission identity. Coordinate stopped runtimes.
+- **Validation:** Standard venv checks without skips; strict input/OpenAPI/hash tests
+  pinned to actual prior immediate/scheduled digests; real PostgreSQL mixed priority,
+  rank/timestamp/UUID ties, sustained urgent arrivals with aged-low progress, locked
+  rows, independent selector contention, future/retry gating, lease reclamation,
+  targeted low-ID execution and retry/manual age reset. Verify ordering independent
+  of session timezone and new indexes against PostgreSQL. Migration roundtrips,
+  backfill/default/range constraints, concurrent downgrade guard and schema drift;
+  Windows/Linux API -> scheduler/worker/dispatcher CLI -> SDK/emulator/push smokes
+  demonstrate database selection, without asserting broker arrival/completion order.
 
 ## 12 - Observability
 
@@ -432,54 +471,56 @@ flowchart LR
 
 # Current milestone details
 
-Milestone 10 implements D014 with optional original scheduled_at, SCHEDULED
-admission intent, a due partial index, migration 0008 and a separate scheduler CLI.
-Aware RFC 3339 dates normalize to UTC; any non-NULL date requires scheduler
-admission, even if already due. Omitted/NULL dates preserve immediate behavior and
-all existing D011 fingerprints. Timestamped requests hash normalized UTC instants
-with six fractional digits; original dates and hashes survive execution/recovery.
+Milestone 11 implements D015: immutable strict priority 0..9, default 0, with a
+fixed five-second head start per level. Database selectors rank eligible UTC time
+minus priority * five seconds, then eligibility timestamp and UUID. Continually
+eligible unlocked work older than the maximum 45-second head start ranks ahead
+of fresh urgent arrivals; capacity, advancing database time and selector progress
+are required. This is a limited selection policy, without global execution order,
+preemption or a finite wall-time service guarantee.
 
-The scheduler samples PostgreSQL time, selects one bounded due batch in date/UUID
-order with FOR UPDATE SKIP LOCKED and atomically commits PENDING plus fresh current
-outbox obligations. No scheduler lease, broker import/network call or execution
-attempt is involved. Rollback/cancellation retains SCHEDULED; commit retains outbox
-through restart before publication. Multiple schedulers admit each row once.
+Internal Job.ready_at begins at greatest(database creation, original schedule).
+Initial past dates invent no age. Admission/publication retain readiness; automatic
+retry resets it to next_attempt_at and manual recovery resets it to current database
+time. Priority/date/hash/history persist across generations. Default-priority
+selection now orders readiness episodes rather than historical creation or requested
+past dates. Listing remains creation-ordered, and ID-specific execution remains
+independent of other jobs' priorities. Due/status/budget/ownership gates are unchanged.
 
-SCHEDULED ID deliveries ACK durable admission intent, before or after due time,
-including during uncommitted admission. Initial PENDING/QUEUED execution also
-checks the original database due time. Automatic retries retain next_attempt_at;
-manual recovery retains the original schedule but starts an immediate generation.
-Defensive publication skips unadmitted SCHEDULED obligations. Continuous scheduler
-polling retries database outages; --once admits one batch and surfaces failure.
-Portable shutdown drains or cancels the current transaction before disposing its engine.
+Dispatch joins immutable Job.priority, ranking READY by available_at and expired
+PUBLISHING by lease_expires_at. Only outbox rows are locked, preserving existing
+finalization lock order. Broker messages and outbox schema stay unchanged; joined
+sorting cost remains benchmark work. Two partial UTC rank indexes support job
+selection while existing due/lease indexes remain.
 
-Migration leaves all legacy rows/dates/hashes/history/obligations unchanged. Its
-locked downgrade guard refuses any retained original schedule, including completed
-work, to prevent silently losing date/key semantics. No new dependency, priority,
-recurrence, schedule editing or cloud resources were introduced.
+Effective priority 0 is omitted from fingerprints, preserving every retained
+D011/D014 digest. Nonzero priorities contribute immutable submission content.
+Migration 0009 backfills known retry/recovery/initial readiness, without changing
+existing records or identity. Locked downgrade refuses any nonzero priority,
+including completed jobs; default-only records can return to 0008. No new dependency,
+cloud resource, recurring schedule or edit API is introduced.
 
-Validation completed on 2026-10-06:
+Validation completed on 2026-10-09:
 
-- Standard venv `python scripts/check.py`: Ruff passes, strict mypy passes for 20
-  source files and all 762 tests pass without skips in 102.10 seconds.
-- New scheduling/runtime unit tests and actual
-  PostgreSQL admission tests pass date/hash compatibility, bounded ordered batches,
-  independent replicas/worker/push races, locked-row progress, fixed clock cutoff,
-  whole-batch rollback/cancellation, durable early ACK, restart before publication,
-  due-time defense, original dates across automatic/manual recovery and legacy keys.
-- All 15 PostgreSQL migration cases pass NULL legacy preservation, repeated 0007
-  round trips, due index, scheduled-state constraints and downgrade refusal for
-  future/admitted/terminal schedules. A concurrent submission commits before the
-  locked guard and is preserved when downgrade refuses. Disposable metadata drift
-  checks pass; application is migrated to 0008 with no host/container drift.
-- Host/container pip checks and Compose configuration pass; the non-root Linux
-  image builds. Windows/Python 3.13.1 and Linux/Python 3.12.15 live API -> scheduler
-  CLI -> dispatcher CLI -> Google SDK -> emulator -> push smokes pass future
-  schedule/offset identity, early and due-unadmitted ID ACK without attempts/outbox,
-  separate scheduler/polling due gates, scheduler restart before due and after
-  admission, single persisted obligation and execution after due with original date.
-  Existing retries, recovery, replay/duplicate and broker outage probes stay green;
-  all disposable resources clean up.
+- Standard venv `python scripts/check.py`: Ruff passes, strict mypy passes for 21
+  source files and all 842 tests pass without skips in 124.50 seconds. Includes
+  25 new priority unit cases and 40 real PostgreSQL priority cases: mixed levels,
+  exact 44/45/46-second boundaries, deterministic readiness/UUID ties, 12 selector
+  passes with 36 fresh urgent arrivals and aged-low progress, locked-row skipping,
+  independent ownership, due/lease gating, targeted low-ID execution, timezone
+  independence, retry/manual age resets and pinned pre-upgrade submission replays.
+- All 15 PostgreSQL priority migration tests pass legacy record/hash preservation,
+  readiness backfill/default/range/null constraints, repeated round trips, usable
+  UTC rank indexes across UTC/Warsaw/Lord Howe session timezones, nondefault terminal
+  downgrade refusal and concurrent submission fencing. Revision 0008's original
+  schedule guard remains intact. Application is at 0009; host and rebuilt container
+  schema drift checks report no new operations.
+- Windows/Python 3.13.1 and Linux/Python 3.12.15 live API -> scheduler/worker/dispatcher
+  CLI -> SDK/emulator -> push smokes pass mixed priority publication, equal-rank UUID ties, targeted
+  low-ID execution and aged-low progress during fresh urgent arrival passes.
+  Explicit priority-0 replay retains original keyed identity; all prior probes pass
+  and disposable resources clean up. Compose configuration and host/container pip
+  checks pass; the non-root Linux image builds and runs the same policy.
 
 Cloud scheduler invocation/CPU policy and broker DLQ/IAM remain deployment-stage
 validation in milestone 15. Local polling makes no cloud hosting claim.
@@ -505,15 +546,16 @@ them and does not postpone correctness testing.
 - D012: application attempt authority, persisted retry timing/history and atomic replacement dispatch.
 - D013: explicit dead-letter exhaustion, generation-fenced manual recovery and retained history.
 - D014: durable scheduled admission, database-clock eligibility and compatible schedule identity.
+- D015: bounded priority preference, eligibility-episode aging and unchanged ID authority.
 
 # Risks / technical debt
 
-- Milestones 0-10's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
+- Milestones 0-11's local acceptance checks pass. Cloud IAM/provisioning/delivery remain
   deployment-stage validation, not evidence supplied by the emulator.
 - No cloud environment or spending authorization has been established. Cloud rollout
   must not be claimed validated from local tests.
-- Cloud IAM, broker DLQ operations, dispatcher/scheduler
-  hosting and priority semantics still need deployment/reliability decisions.
+- Cloud IAM, broker DLQ operations and dispatcher/scheduler hosting still need
+  deployment/reliability decisions. Priority cannot impose global broker execution order.
 - `LocalQueue` loses buffered messages on process exit. The outbox is durable, but
   marking acceptance requires a transport whose acceptance guarantees fit deployment.
   A dispatcher must be invoked to publish/replay obligations; local tests do not
@@ -532,11 +574,14 @@ them and does not postpone correctness testing.
 - Original scheduled_at has no edit/retention API. Migration 0008 downgrade refuses
   while any original date remains, including completed work. PostgreSQL clock defines
   due eligibility; host clock, polling and broker ordering do not define execution time.
+- Nonzero priority belongs to retained submission identity; migration 0009 downgrade
+  refuses while it exists. The fixed five-second quantum/range and rank indexes
+  need coordinated changes. Joined dispatch sorting still needs benchmark evidence.
 - Host tests use Python 3.13.1; container runtime smokes use Python 3.12.15. This
   evidence does not establish a full Python-version test matrix.
 
 # Next actions
 
-1. Ask whether to start milestone 11; do not implement it before authorization.
-2. If authorized, define dispatch priority, ties and starvation policy before behavior.
-3. Keep cloud scheduler hosting and broker DLQ policy in milestone 15.
+1. Ask whether to start milestone 12; do not implement it before authorization.
+2. If authorized, define correlation/log redaction and metric meanings before behavior.
+3. Keep cloud hosting/DLQ/IAM in milestone 15; benchmark query costs at milestone 17.

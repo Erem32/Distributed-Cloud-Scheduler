@@ -4,7 +4,8 @@ A portfolio backend project focused on explainable distributed job execution,
 PostgreSQL transactions, delivery semantics and failure recovery. Development is
 local-first and follows validated milestones. The local foundation contains a
 FastAPI API, persisted jobs with optional submission idempotency, atomic execution,
-scheduled jobs with a separate scheduler, bounded execution retries, dead-letter
+scheduled jobs with a separate scheduler, bounded priority preference with aging,
+bounded execution retries, dead-letter
 context, manual recovery, attempt history
 and durable dispatch obligations,
 PostgreSQL connectivity, explicit Alembic migrations, container setup and a
@@ -46,6 +47,8 @@ Revision 0007 adds recovery generations and final dead-letter context, retaining
 all existing records as generation zero without reclassifying historical failures.
 Revision 0008 adds original schedule timestamps, SCHEDULED admission intent and
 a partial due index. Legacy submissions keep NULL dates and their original hashes.
+Revision 0009 adds immutable priority and internal readiness timestamps for bounded
+preference with aging. Legacy priority is zero and retains every original hash.
 
 The target cloud stack is GCP Pub/Sub, Cloud Run and Cloud SQL, added after local
 execution and concurrency have been proved. See the
@@ -164,6 +167,8 @@ and invalid Unicode are rejected. `max_attempts` is an integer from 1 to 20
 in UTC. Without an `Idempotency-Key`, repeated requests create separate jobs.
 Optional `scheduled_at` controls initial scheduler admission; see the scheduling
 section below for its timestamp format and runtime requirement.
+Optional `priority` is a strict integer 0 through 9 (default 0), exposed in job
+reads. Higher values give eligible work a bounded preference; see the policy below.
 
 List `limit` is 1 through 100 (default 20); `offset` is 0 through 10,000 (default
 0). Ordering is deterministic within a database snapshot; offset pages can shift
@@ -218,7 +223,8 @@ scheduled admission intent. Immediate submissions have one outbox obligation;
 scheduled submissions gain that obligation during scheduler admission.
 Matching replay returns 200 with the same job's current state, including any
 completed result or failure. Reusing a key for different type, payload or
-`max_attempts` or original `scheduled_at` returns sanitized 409. Concurrent API replicas coordinate through
+`max_attempts`, original `scheduled_at` or effective `priority` returns sanitized
+409. Concurrent API replicas coordinate through
 PostgreSQL uniqueness; replay creates no new job/outbox or execution attempt.
 Rolled-back submissions, including cancellation during an unfinished insert,
 leave the key reusable. If a response is lost or commit acceptance is ambiguous,
@@ -236,6 +242,9 @@ fingerprint. Non-NULL dates add a UTC ISO string with six fractional digits;
 equivalent instants expressed with different offsets/fraction spellings match.
 The original schedule remains part of submission identity after admission,
 automatic retries and manual recovery.
+Omitted and explicit `priority: 0` preserve every earlier immediate and scheduled
+fingerprint. Nonzero priority contributes its integer value. Priority is immutable
+across automatic retries and manual recovery; no priority-edit API is provided.
 
 Keys remain bound while their jobs exist; there is no expiry or deletion/retention
 feature yet. Keys and fingerprints are internal and are absent from job responses.
@@ -253,6 +262,50 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/jobs -Method Post -Headers $headers
 
 Swagger exposes the optional header and the 200/201/409 responses. See
 [D011](docs/DECISIONS.md) for the transaction and normalization choices.
+
+## Priority policy and aging
+
+Submit `priority` from 0 to 9; larger values receive a five-second head start per
+level, at most 45 seconds. For example:
+
+```json
+{"type":"calculation","payload":{"numbers":[1,2,3]},"priority":9}
+```
+
+Scheduler admission, local polling and outbox publication select due, unlocked
+database candidates by eligibility time minus `priority * 5 seconds`, then
+eligibility time and UUID. At equal eligibility, higher priority wins. A priority-0
+candidate eligible for more than 45 seconds ranks ahead of a freshly eligible
+priority-9 candidate. Equal ranks prefer earlier eligibility; UUID resolves remaining
+ties. This aging policy needs no background score updates or shared counters.
+
+Job eligibility begins at database creation time for immediate submissions, or
+the later of creation and original scheduled time. Submitting a past date does
+not invent waiting time. Admission and publication retain that age; automatic
+retry starts a new waiting period at next_attempt_at, and manual recovery starts
+one at current database time. Internal ready_at stores this episode boundary and
+is absent from public reads/input. Dispatch ranks READY obligations by available_at
+and reclaimable PUBLISHING obligations by lease expiry, joining original job priority.
+Publication failure/backoff and expired lease reclamation start new dispatch
+waiting periods. Job waiting age is independent of publication attempts.
+
+Priority never bypasses a future schedule/retry, claim ownership or attempt limit.
+Locked candidates may be skipped, and existing executions continue. A delivered
+ID claims its specific eligible job, even if a higher-priority job is waiting.
+Concurrent selectors, publication, broker delivery and worker capacity can change
+execution order. This policy promises database selection preference; it supplies
+no global execution order, preemption or finite wall-time completion bound.
+
+With a progressing selector, available capacity and advancing database time,
+continuously eligible unlocked work cannot be starved by fresh urgent arrivals
+after the maximum head start. Older backlog, locks and outages may still delay it.
+Priority is a preference parameter, not access control or resource isolation.
+
+Migration 0009 preserves existing jobs, hashes, history and obligations, assigning
+priority 0 and deriving readiness from known creation/schedule/retry/recovery
+timestamps. Stop runtimes before migration. Downgrade locks all three tables and
+refuses while any nonzero priority remains, even on completed jobs, protecting
+original submission identity. See [D015](docs/DECISIONS.md) for the policy and indexes.
 
 ## Scheduled jobs and scheduler
 
@@ -279,7 +332,7 @@ docker compose run --rm api python -m distributed_cloud_scheduler.scheduler --on
 
 `--once` admits one bounded batch and exits; it does not wait for future jobs.
 Continuous mode drains due batches and polls when idle. The scheduler uses the
-PostgreSQL clock, locks due SCHEDULED jobs in scheduled_at/UUID order with
+PostgreSQL clock, locks due SCHEDULED jobs in the priority/aging order above with
 `FOR UPDATE SKIP LOCKED`, and commits PENDING plus one immediate outbox per job in
 the same transaction. Skipped locked rows can be admitted on a later pass; this is
 admission order among available rows, without a global execution-order guarantee.
@@ -547,6 +600,8 @@ delivery, stale retry conflicts, keyed replay and skipped obsolete obligations,
 future schedule/early ACK, UTC schedule identity, separate scheduler/worker due
 gating and scheduler restart before due and after admission, followed by live
 dispatcher delivery,
+bounded priority publication/admission/polling selection with deterministic ties,
+targeted low-ID execution and aged-low progress under continued urgent arrivals,
 malformed/unknown/oversized requests, and durable publication recovery after a
 broker connection failure.
 It removes its resources and fails when prerequisites or checks fail.
@@ -614,6 +669,10 @@ Scheduling tests cover datetime/hash compatibility, bounded ordered admission,
 competing schedulers, locked-row progress, rollback/cancellation, durable restart,
 early push ACK, original dates across retry/recovery and scheduler resource cleanup.
 Migration tests preserve legacy NULL dates and refuse schedule identity loss.
+Priority tests cover strict inputs and legacy hashes, rank/timestamp/UUID ties,
+future eligibility, locked-row progress, competing selectors, sustained urgent
+arrivals, targeted ID execution and fresh retry/recovery age. Migration tests cover
+readiness backfill, default-zero identity, UTC rank indexes and guarded downgrade.
 
 ## Engineering documents
 
