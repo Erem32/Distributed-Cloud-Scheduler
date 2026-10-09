@@ -1,11 +1,11 @@
 # Project status
 
-- **Current milestone:** 16 - local verification automation (COMPLETE; awaiting
-  approval to start milestone 17).
-- **Current state:** Milestones 0-16 pass their local acceptance criteria.
+- **Current milestone:** 17 - local load tests and benchmarks (COMPLETE; awaiting
+  approval to start milestone 18).
+- **Current state:** Milestones 0-17 pass their local acceptance criteria.
   On Python 3.13.1, `python scripts/check.py` passes Ruff, strict mypy (22 source
-  files), and all 849 tests without skips. PostgreSQL is at revision 0009 and
-  `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
+  files), and all 981 tests without skips (187.83 seconds). PostgreSQL is at revision
+  0009 and `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
   PostgreSQL 17 and the emulator are healthy. The multi-role Python 3.12 image
   builds, runs API/worker/scheduler as UID 10001, and passes readiness and SIGTERM
   lifecycle smokes.
@@ -70,8 +70,23 @@
   interpreter, stopping at the first failure. The full local run passed Ruff,
   mypy for 22 source files and all 849 tests without skips; no hosted runner,
   cloud command or paid service was used.
-- **Next objective:** Await approval before starting milestone 17. Keep load and
-  reliability experiments local and bounded.
+- **Milestone 17 validation:** Four real Docker/HTTP/PostgreSQL smoke runs completed
+  80 measured jobs; an intentional 1 ms deadline produced incomplete evidence,
+  nonzero exit and successful cleanup. The full matrix completed all 24 runs:
+  7,200 measured successes and 480 excluded warmup successes, with one successful
+  generation-zero attempt and one READY outbox per job. Independent raw analysis
+  reproduced all 48 warmup/measured summaries, accounting, percentiles, resource
+  limits and observed concurrency bounds. Suite duration was 314.76 seconds;
+  every batch stayed within 60 seconds. Existing demo container IDs and all 26
+  volume names were preserved; no owned containers/network/volume remained.
+  Ruff, strict mypy and 981 tests pass without skips; `alembic check` reports no drift.
+  Median jobs/s at concurrency 1/5/10/20: calculation 43.54/67.05/67.55/66.19;
+  50 ms sleep 14.38/54.04/70.91/69.23. Worker sampled CPU near its one-core budget
+  supports a likely constraint; sparse samples do not isolate pool/lock costs.
+  See [methodology](benchmarks/README.md), [report](benchmarks/RESULTS.md) and
+  [raw evidence](benchmarks/raw/2026-10-09/suite.json).
+- **Next objective:** Await milestone-checkpoint approval before starting milestone
+  18's bounded local reliability experiment. No cloud or hosted service is in scope.
 - **Milestone 14 design:** Build one multi-stage Python 3.12 slim image, install
   only the project's runtime dependencies, and run directly as the existing
   unprivileged UID. Keep the API as the image default and use its existing module
@@ -85,8 +100,9 @@
   scheduler roles. Verify API `/health` and database-backed `/ready`, role
   shutdown on SIGTERM within the configured grace period, and a separate explicit
   migration command. Keep Compose's default API/database behavior unchanged.
-- **Session boundary:** User approved milestone 15 as local-only demo hardening
-  on 2026-10-09; GCP provisioning, hosted CI and paid services remain prohibited.
+- **Session boundary:** User approved milestone 17 on 2026-10-09. Its acceptance
+  checks pass; await the required continuation checkpoint before milestone 18.
+  Cloud provisioning, hosted CI and paid services remain prohibited.
 - **Git workflow:** Completed milestones 0-5 form one reviewed local checkpoint.
   Each subsequent milestone gets its own local commit after validation/documentation
   and before the continuation checkpoint, as required by AGENTS.md.
@@ -120,6 +136,14 @@ bounded service/outcome/route/status labels, counters, an active execution gauge
 request/handler histograms. Worker recovery events have no fabricated handler duration.
 The CLI worker/dispatcher/scheduler metrics remain in-process and are not remotely
 scrapeable; fleet aggregation and cloud collection are deployment work.
+
+The separate `scripts/local_benchmark.py` developer harness drives real local HTTP
+into disposable, CPU/memory-limited Docker PostgreSQL/API/polling-worker containers.
+It uses existing images without pulls, verifies runtime/source identity, records
+raw job/attempt/outbox and resource observations, reconciles results and cleans up
+only its owned resources. It leaves application behavior and pooling unchanged.
+The benchmark report records bounded finite-batch throughput and latency, not
+sustained-load, broker, multi-replica or cloud capacity.
 
 The publisher boundary and ID-specific execution path are exercised by real
 PostgreSQL tests and live Google SDK/emulator HTTP delivery smokes on Windows and
@@ -583,16 +607,53 @@ flowchart LR
 
 ## 17 - Load tests and benchmarks
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE.
 - **Objective:** Measure scaling and identify the real bottleneck.
-- **Tasks:** Select a justified load tool; define deterministic workloads; compare
-  concurrency 1/5/10/20; record raw output and environment/configuration methodology.
-- **Design questions:** Separate queue/execution/end-to-end latency, warmup, saturation,
-  DB/broker limits, fairness and CPU vs I/O workloads.
-- **Acceptance:** Reproducible jobs/s, p50/p95/p99, failure rate and resource measurements;
-  honest interpretation explains nonlinear scaling.
-- **Validation:** Repeat local benchmark runs with bounded duration and documented
-  resource usage and variance; no cloud or paid load-testing service.
+- **Design:** Use a standalone Python/httpx harness (existing dev dependencies),
+  real loopback HTTP and the existing local runtime image. Own a uniquely named
+  Docker network, PostgreSQL container, API and one continuous polling worker;
+  use only already available images with `--pull never`. Never modify existing
+  demo containers/data. Cap PostgreSQL at 2 CPUs/512 MiB and each application
+  container at 1 CPU/256 MiB. Keep the worker's existing database pool unchanged.
+  Use immediate, priority-zero calculation jobs (numbers 0..999, sum 499500) and
+  50 ms sleep jobs, each with one allowed attempt. Compare concurrency 1/5/10/20,
+  constant HTTP submission concurrency 10 and worker poll interval 0.05 seconds.
+  Exclude 20 warmup jobs per run; measure 300 jobs per run, three repetitions.
+  Defaults create at most 7,680 jobs; CLI hard limits are 1,000 jobs/run, five
+  repetitions, 100 warmup jobs, 120 seconds/run and 15 minutes total. This is a
+  finite submission-and-drain experiment, not a sustained-load capacity test.
+- **Measurements:** Successful jobs/s over a monotonic submission-and-drain window;
+  exact nearest-rank p50/p95/p99 for HTTP submission duration, DB-created-to-claim
+  queue time, DB-claim-to-outcome time and DB-created-to-outcome lifecycle time.
+  Also record client-observed completion using one monotonic clock (includes
+  polling delay). DB timestamps are sampled before transaction commits, so
+  claim/outcome timing includes transaction overhead and is not pure handler time.
+  Sample Docker CPU percentage and memory working set for API/worker/PostgreSQL;
+  record the interval, sampling overhead/coverage and container resource limits.
+- **Acceptance:** All 24 default measured runs complete within bounds. Each accepted
+  job has its expected result, one successful generation-zero attempt and one
+  durable outbox row; job/attempt/outbox accounting reconciles with PostgreSQL.
+  Save per-job raw timing/outcomes, resource samples, configuration, image/version
+  identifiers, host environment and exact commands; report repetition variance,
+  failures and honest scaling/bottleneck limitations without a performance target.
+  Cleanup owned containers/network/anonymous data volumes on success or failure;
+  existing demo resources remain intact. Failed/incomplete runs must be identified
+  and must not be advertised as successful measurements.
+- **Validation:** Meaningful tests cover bounds, measurement/accounting errors,
+  local-only image/resource guards and cleanup; execute a small real-Docker/HTTP/
+  PostgreSQL smoke, then the full repeated benchmark. Run the project's virtual
+  environment `python scripts/check.py` with real PostgreSQL and no skips, and
+  `alembic check`. Review final/staged diffs and locally commit with the existing
+  Co-authored-by trailer. No cloud, hosted runner or paid load-testing service.
+- **Result:** All acceptance checks passed locally. The 24 measured runs produced
+  7,200 successful jobs with zero failure/accounting errors; 480 warmup jobs were
+  excluded. Raw records, environment/configuration, commands, resource samples,
+  repetition ranges and interpretation are committed with the report. The real
+  small smoke and deliberate deadline failure validated successful and failed-run
+  cleanup. All 132 new harness tests and the full 981-test local gate pass without
+  skips; schema drift check passed. Concurrency 20 did not improve median throughput
+  over 10 in either workload. No runtime optimization, dependency, cloud action,
+  hosted service or milestone 18 implementation was added.
 
 ## 18 - Reliability experiment
 
@@ -730,10 +791,12 @@ Verification on 2026-10-09:
 - D016: redacted lifecycle logs, bounded Prometheus metrics and process-local scope.
 - D018: zero-spend boundary; superseded by D019's local-only scope.
 - D019: free local demo; GCP provisioning and hosted/billable automation deferred.
+- D020: bounded isolated local benchmarks, raw per-job measurements and explicit
+  transaction/polling/resource measurement limitations.
 
 # Risks / technical debt
 
-- Milestones 0-14's local acceptance checks pass. Cloud IAM/provisioning/delivery
+- Milestones 0-17's local acceptance checks pass. Cloud IAM/provisioning/delivery
   are deferred indefinitely; local tests do not validate cloud behavior.
 - Cloud IAM, broker DLQ operations and dispatcher/scheduler hosting still need
   deployment/reliability decisions. Priority cannot impose global broker execution order.
@@ -763,9 +826,17 @@ Verification on 2026-10-09:
   need coordinated changes. Joined dispatch sorting still needs benchmark evidence.
 - Host tests use Python 3.13.1; container runtime smokes use Python 3.12.15. This
   evidence does not establish a full Python-version test matrix.
+- Benchmarks share a Windows/Docker Desktop host with the existing demo and have
+  finite bursts, three repetitions and sparse resource samples. CPU ceilings are
+  observed likely constraints; precise profiling, connection/lock wait attribution,
+  sustained capacity and fleet scalability are unmeasured. See the report before
+  using throughput or latency numbers outside their measured conditions.
 
 # Next actions
 
-1. Finish the local-only demo profile, walkthrough and local end-to-end acceptance.
-2. Keep GCP provisioning and hosted/billable automation out of scope unless the user
-   explicitly changes the zero-cost requirement.
+1. Await approval to start milestone 18's bounded local reliability experiment:
+   controlled transient failures, completion/retry/dead-letter/recovery measurements
+   and reconciliation with PostgreSQL attempt history.
+2. Milestone 19 is optional and requires separate explicit approval after milestones
+   0-18. It is not required for the CV-ready Python project.
+3. Keep cloud provisioning and hosted/billable automation out of scope.

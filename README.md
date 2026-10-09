@@ -764,6 +764,21 @@ future eligibility, locked-row progress, competing selectors, sustained urgent
 arrivals, targeted ID execution and fresh retry/recovery age. Migration tests cover
 readiness backfill, default-zero identity, UTC rank indexes and guarded downgrade.
 
+## Local benchmarks
+
+The bounded local benchmark harness compares the existing calculation and sleep
+handlers with worker concurrency 1, 5, 10 and 20. It uses real loopback HTTP,
+isolated PostgreSQL/API/worker containers, already available local images, and
+explicit CPU/memory/job/time limits. See the [experiment methodology](docs/benchmarks/README.md)
+for commands, measurement definitions and limitations. It does not require cloud
+credentials or a hosted load-testing service.
+
+The [measured report](docs/benchmarks/RESULTS.md) records 24 local runs and 7,200
+successful jobs with PostgreSQL attempt reconciliation, raw timings and resource
+samples. Under the recorded one-CPU worker limit, the 50 ms waiting workload's
+median batch throughput rose from 14.38 jobs/s at concurrency 1 to 70.91 at 10;
+concurrency 20 provided no further median improvement.
+
 ## Engineering documents
 
 - [Project specification](docs/PROJECT_SPEC.md): purpose, boundaries and target design.

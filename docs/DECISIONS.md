@@ -876,3 +876,54 @@ project itself from generating cloud/service charges.
 they are not deployment instructions or validated behavior. No Terraform,
 cloud IAM or production delivery acceptance is required. Any change that adds a
 hosted or billable service needs separate explicit user authorization.
+
+## D020 - Bounded isolated local performance measurements
+
+**Date:** 2026-10-09
+
+**Status:** Accepted for milestone 17; validation evidence recorded in PLAN
+
+**Decision:** Use the existing Python/httpx development dependencies to drive real
+loopback HTTP into the already available local runtime image. Create uniquely
+named, disposable Docker PostgreSQL/API/polling-worker resources with explicit
+CPU/memory/job/time limits and `--pull never`. Leave existing demo services and
+data alone. Compare worker concurrency 1, 5, 10 and 20 for finite calculation and
+50 ms sleep batches with fixed submission concurrency, excluded warmup and three
+repetitions. Keep runtime behavior, handlers and database pooling unchanged.
+
+Persist individual HTTP/monotonic timings and authoritative PostgreSQL job/attempt
+timestamps, outcomes and accounting, plus Docker CPU/memory samples. Compute
+nearest-rank percentiles from raw samples, rather than estimating them from the
+existing histogram buckets. Report successful throughput over the entire measured
+submission-and-drain window. Separate request, queue, claim-to-outcome, persisted
+lifecycle and client-observed completion timing. Reconcile each expected result
+with one generation-zero attempt and one dispatch obligation. Remove only resources
+created by this invocation, including their anonymous PostgreSQL volume.
+
+**Context:** The user needs credible, reproducible CV evidence without cloud or
+hosted services. Existing API/worker/attempt records and deterministic handlers
+already supply a complete measurable path. An active local demo may coexist with
+the experiment, and the worker's default pool (5 retained + 10 overflow) may limit
+concurrency 20 independently of its execution slots.
+
+**Alternatives:** Hosted load testing; installing a separate load platform; using
+in-process ASGI calls; measuring only sleep duration; silently tuning the runtime
+or replacing PostgreSQL; treating histogram estimates as exact percentiles.
+
+**Reasoning:** A small finite harness measures the supported local runtime without
+new dependencies or application changes. Disposable containers provide explicit
+resource ceilings and repeatable state. Raw observations make every reported
+quantile and accounting claim reviewable.
+
+**Consequences:** These are finite local batch measurements, not production,
+cloud, sustained-arrival or exactly-once guarantees. PostgreSQL timestamps are
+sampled before commits; claim-to-outcome includes database/transaction overhead
+and is not pure handler duration. Client completion includes polling delay.
+Docker CPU and memory are sampled observations (working set excludes cache), not
+continuous profiling or complete host resource accounting. Resource collection
+intervals must overlap the batch but can finish after it, including idle time;
+sub-second smokes establish plumbing, not busy CPU peaks. Calculation is tiny
+and sleep simulates waiting; neither establishes CPU-heavy performance, scheduler
+fairness, broker capacity or global scalability. Background host activity, Docker
+virtualization and finite samples affect results. Unexpected failures and incomplete
+runs must be retained/reported honestly, and are not successful acceptance runs.
