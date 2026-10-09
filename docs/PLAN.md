@@ -1,8 +1,8 @@
 # Project status
 
-- **Current milestone:** 15 - free local demo hardening (COMPLETE; awaiting
-  approval to start milestone 16).
-- **Current state:** Milestones 0-15 pass their local acceptance criteria.
+- **Current milestone:** 16 - local verification automation (COMPLETE; awaiting
+  approval to start milestone 17).
+- **Current state:** Milestones 0-16 pass their local acceptance criteria.
   On Python 3.13.1, `python scripts/check.py` passes Ruff, strict mypy (22 source
   files), and all 849 tests without skips. PostgreSQL is at revision 0009 and
   `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
@@ -63,8 +63,15 @@
   No images were pulled, no cloud services were used, and the isolated containers,
   network and volume were removed. Ruff and strict mypy pass; all 849 tests pass
   without skips; `alembic check` reports no drift.
-- **Next objective:** Await approval before starting milestone 16. Continue to
-  exclude GCP provisioning, hosted CI and paid services.
+- **Milestone 16 scope:** User approved local verification automation only. Keep
+  hosted runners, GCP provisioning and paid services out of scope.
+- **Milestone 16 validation:** No `.github/workflows` directory exists. The
+  existing `scripts/check.py` runs Ruff, strict mypy and pytest via the active
+  interpreter, stopping at the first failure. The full local run passed Ruff,
+  mypy for 22 source files and all 849 tests without skips; no hosted runner,
+  cloud command or paid service was used.
+- **Next objective:** Await approval before starting milestone 17. Keep load and
+  reliability experiments local and bounded.
 - **Milestone 14 design:** Build one multi-stage Python 3.12 slim image, install
   only the project's runtime dependencies, and run directly as the existing
   unprivileged UID. Keep the API as the image default and use its existing module
@@ -554,16 +561,25 @@ flowchart LR
 
 ## 16 - Local verification automation
 
-- **Status:** NOT STARTED (hosted runners and deployment automation deferred).
+- **Status:** COMPLETE (hosted runners and deployment automation deferred).
 - **Objective:** Preserve reproducible, cost-free local verification.
-- **Tasks:** Keep `python scripts/check.py` as the local quality gate. Do not add
-  hosted workflows or image publication/deployment that can consume paid quotas
-  unless the user separately authorizes the resulting cost/risk.
-- **Design questions:** Keep verification local and avoid workflows or tools that
-  transfer data to hosted/billable services. Do not add deployment automation.
-- **Acceptance:** Local verification remains reproducible with no hosted service.
-- **Validation:** Run local quality commands; no hosted workflow or cloud deployment
-  is required or authorized.
+- **Tasks:** Retain `python scripts/check.py` as the single local gate. It invokes
+  Ruff, mypy and pytest using the active interpreter. No hosted workflows, image
+  publication or deployment automation is in scope.
+- **Design:** Reuse the existing standard command rather than duplicate its checks.
+  Quality runs use the selected local virtual environment; PostgreSQL integration
+  tests use the local test database. The check command itself does not deploy,
+  contact GCP, or invoke a hosted runner.
+- **Acceptance:** A clean local run executes Ruff, strict mypy and the full test
+  suite with integration tests enabled and no skips. Document the command and its
+  local-only behavior. Add no CI configuration or paid service dependency.
+- **Validation:** Run `python scripts/check.py` from the project virtual
+  environment, inspect that no hosted workflow exists, and verify no cloud
+  command/service is used.
+- **Result:** `python scripts/check.py` passed Ruff, strict mypy (22 source
+  files) and all 849 tests without skips. No hosted workflow or cloud action was
+  run; no additional automation was added because the existing local gate fully
+  satisfies this milestone.
 
 ## 17 - Load tests and benchmarks
 

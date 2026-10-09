@@ -730,7 +730,8 @@ random schema. Tests never downgrade the application's database and never use
 SQLite as a substitute for PostgreSQL.
 
 The standard command runs `ruff check .`, strict `mypy src`, and `pytest` with the
-active interpreter. The `src` layout requires installing the package. Unit tests
+active interpreter. It runs locally and does not use hosted CI, GCP, or paid APIs.
+The `src` layout requires installing the package. Unit tests
 cover settings, error sanitization, liveness, readiness cancellation and resource
 cleanup and job validation. Database tests cover real async connections/readiness,
 job API persistence/ordering, database constraints, competing claims, stale-token
