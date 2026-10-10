@@ -927,3 +927,47 @@ and sleep simulates waiting; neither establishes CPU-heavy performance, schedule
 fairness, broker capacity or global scalability. Background host activity, Docker
 virtualization and finite samples affect results. Unexpected failures and incomplete
 runs must be retained/reported honestly, and are not successful acceptance runs.
+
+## D021 - Seeded local recovery and exhaustion cohorts
+
+**Date:** 2026-10-10
+
+**Status:** Accepted and validated in milestone 18; evidence recorded in PLAN
+
+**Decision:** Reuse the bounded local Docker lifecycle from D020 for a separate
+developer-only reliability harness. Submit the existing controlled-failure handler
+with exactly 10% seeded first-attempt failures. Compare an attempt-budget-3 recovery
+cohort with a matching budget-1 exhaustion control across three seeds. Keep runtime
+jitter random and record its persisted due times; do not change application code,
+schema, dependencies or existing demo data. Use only cached local images.
+
+Derive first-attempt success and automatic retry counts from PostgreSQL attempt
+history. Reconcile every job and dispatch obligation, including final application
+dead-letter context. Measure recovery between the first failed and final successful
+attempt outcomes, decomposed into chosen backoff, due-to-claim delay and final
+claim-to-outcome duration. Record raw rows, fault-index/UUID mappings, commands,
+environment and script hashes. An expected exhausted control is a valid observation;
+unexpected failures and censored observations fail the experiment and retain evidence.
+
+**Context:** The remaining required milestone needs measurable, reproducible local
+failure-recovery evidence for the Python portfolio, within the zero-spend boundary.
+Existing controlled failures, persisted retry timing, attempt history and application
+dead letters provide the necessary experiment without new production fault switches.
+
+**Alternatives:** Random unrecorded failures, adding runtime fault injection,
+dependency outages, broker experiments, seeding production jitter, or measuring
+only terminal job timestamps without retained attempt history.
+
+**Reasoning:** Matching seeded cohorts separate recoverable faults from budget
+exhaustion. Existing behavior and authoritative rows make accounting reviewable.
+The explicit control prevents treating a low failure percentage as a universal
+recovery guarantee. Shared resource guards avoid a second Docker safety mechanism.
+
+**Consequences:** This tests controlled handler failures and application budgets;
+it establishes no cloud, broker DLQ, dependency-outage or worker-crash recovery
+guarantee. Unpublished READY outboxes demonstrate durable intent only. Job
+`started_at` describes the latest attempt, so first-attempt timing uses history.
+Database timestamps precede commits; client observations include polling delay.
+Fault membership is reproducible, while UUIDs, runtime jitter and timing vary.
+Each default recovery cohort supplies only 30 recovery samples, so nearest-rank
+p99 is the observed maximum and cannot establish a tail-latency SLA.

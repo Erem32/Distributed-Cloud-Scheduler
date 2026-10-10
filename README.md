@@ -13,6 +13,12 @@ deployment is deferred indefinitely; no cloud services are required or used by
 the local demo. See the
 [living plan](docs/PLAN.md).
 
+For a concise demonstration and CV wording, see the
+[portfolio guide](docs/PORTFOLIO.md). Reproducible local
+[performance](docs/benchmarks/RESULTS.md) and
+[reliability](docs/reliability/RESULTS.md) reports include raw PostgreSQL evidence
+and explicit measurement limits.
+
 ## Current architecture
 
 ```mermaid
@@ -779,11 +785,26 @@ samples. Under the recorded one-CPU worker limit, the 50 ms waiting workload's
 median batch throughput rose from 14.38 jobs/s at concurrency 1 to 70.91 at 10;
 concurrency 20 provided no further median improvement.
 
+## Local reliability experiment
+
+The bounded [reliability harness](docs/reliability/README.md) runs seeded
+controlled first-attempt failures against the existing API, PostgreSQL and polling
+worker. Three matching pairs of retry-budget cohorts submitted 1,800 jobs with
+exactly 10% fault injection. Recovery cohorts reached 900/900 successes with 90
+automatic retries; one-attempt-budget controls reached 810/900 successes and 90
+expected application dead letters. All 1,890 attempts and outbox rows reconcile
+with the [raw report](docs/reliability/RESULTS.md).
+
+Median per-run recovery p50/p95/p99 were 1.012/1.726/1.730 seconds from first
+failed outcome to final successful outcome. Each run has only 30 recovery samples;
+these are controlled local observations, with no production or cloud guarantee.
+
 ## Engineering documents
 
 - [Project specification](docs/PROJECT_SPEC.md): purpose, boundaries and target design.
 - [Living development plan](docs/PLAN.md): current architecture, validation and next work.
 - [Architecture decisions](docs/DECISIONS.md): significant choices and trade-offs.
+- [Portfolio guide](docs/PORTFOLIO.md): CV wording, local walkthrough and interview evidence.
 - [Development workflow](AGENTS.md): persistent rules for future contributions.
 
 Key decisions: PostgreSQL owns state and dispatch obligations; migrations run

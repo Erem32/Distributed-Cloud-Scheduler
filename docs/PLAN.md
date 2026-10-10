@@ -1,14 +1,14 @@
 # Project status
 
-- **Current milestone:** 17 - local load tests and benchmarks (COMPLETE; awaiting
-  approval to start milestone 18).
-- **Current state:** Milestones 0-17 pass their local acceptance criteria.
+- **Current milestone:** 18 - local reliability experiment (COMPLETE).
+- **Current state:** Required milestones 0-18 pass their local acceptance criteria;
+  the local Python backend is ready to present on a CV using the portfolio guide.
   On Python 3.13.1, `python scripts/check.py` passes Ruff, strict mypy (22 source
-  files), and all 981 tests without skips (187.83 seconds). PostgreSQL is at revision
-  0009 and `alembic check` reports no drift. The live Windows Pub/Sub emulator smoke passes;
-  PostgreSQL 17 and the emulator are healthy. The multi-role Python 3.12 image
-  builds, runs API/worker/scheduler as UID 10001, and passes readiness and SIGTERM
-  lifecycle smokes.
+  files), and all 1,125 tests without skips (128.36 seconds, 2026-10-10).
+  PostgreSQL is at revision 0009 and `alembic check` reports no drift. The live
+  Windows Pub/Sub emulator smoke was validated on 2026-10-09. The cached multi-role
+  Python 3.12 image builds, runs API/worker/scheduler as UID 10001, and passes
+  readiness and SIGTERM lifecycle smokes.
 - **Milestone 12 design:** Emit one-line JSON lifecycle events with an allowlisted
   field set and job ID correlation across API submission/retry, scheduler
   admission, dispatch and execution. Never log payloads, headers, idempotency
@@ -85,8 +85,25 @@
   supports a likely constraint; sparse samples do not isolate pool/lock costs.
   See [methodology](benchmarks/README.md), [report](benchmarks/RESULTS.md) and
   [raw evidence](benchmarks/raw/2026-10-09/suite.json).
-- **Next objective:** Await milestone-checkpoint approval before starting milestone
-  18's bounded local reliability experiment. No cloud or hosted service is in scope.
+- **Milestone 18 validation:** Six 300-job cohorts completed in 39.90 seconds,
+  with exactly 10% seeded first-attempt faults. Recovery cohorts had 900 successes,
+  90 automatic retries and no dead letters; matching budget-1 controls had 810
+  successes and 90 expected application dead letters. All 1,800 jobs and 1,890
+  attempts/outboxes reconcile, including 1,620 first-attempt successes and 180
+  failed attempt-1 records. Independent stdlib analysis reproduced all six full
+  summaries, fault schedules, timing components/quantiles and both script/all
+  22 application hashes. Retry starts respected due times. Median per-run recovery
+  p50/p95/p99: 1.012/1.726/1.730 seconds; each run has 30 recovery samples.
+  A separate 40-job smoke and intentional deadline failure validated accounting,
+  partial evidence/nonzero exit and cleanup. All 11 existing container IDs, 26
+  volumes and six networks were preserved. All 144 new harness tests and the full
+  local gate pass; no runtime, schema or dependency changes. See
+  [methodology](reliability/README.md), [report](reliability/RESULTS.md),
+  [raw evidence](reliability/raw/2026-10-10/suite.json) and
+  [CV/demo guide](PORTFOLIO.md).
+- **Next objective:** Present the completed local Python project using validated
+  evidence. No required implementation remains; C++ is optional and unapproved.
+  Cloud and hosted/billable services remain out of scope.
 - **Milestone 14 design:** Build one multi-stage Python 3.12 slim image, install
   only the project's runtime dependencies, and run directly as the existing
   unprivileged UID. Keep the API as the image default and use its existing module
@@ -657,19 +674,61 @@ flowchart LR
 
 ## 18 - Reliability experiment
 
-- **Status:** NOT STARTED.
+- **Status:** COMPLETE (2026-10-10).
 - **Objective:** Quantify recovery under controlled transient failures.
-- **Tasks:** Reproducible approximately 10% fault injection; measure initial/eventual
-  completion, attempts per job, dead-letter rate and time to success; publish methodology.
-- **Design questions:** Seeded fault schedules, independent error categories, incomplete
-  observation windows and consistency with the configured retry budget.
-- **Acceptance:** Raw results reconcile with DB attempt records; conclusions distinguish
-  guarantees from experimental outcomes.
-- **Validation:** Controlled runs and accounting invariants using the failure suite.
+- **Design (before implementation):** Add a developer-only Python/httpx harness
+  reusing milestone 17's local Docker guards and owned-resource lifecycle. Use
+  cached images with `--pull never`, real loopback HTTP and private PostgreSQL,
+  API and polling-worker containers. Keep domain behavior, schema, dependencies
+  and existing demo resources unchanged. Apply database 2 CPU/512 MiB and
+  API/worker 1 CPU/256 MiB ceilings, ten submitters and worker concurrency 5.
+- **Workload:** Three seeded repetitions of two 300-job cohorts. Select exactly
+  10% of submission indices using the recorded seed, with the same fault indices
+  in both cohorts. Existing `controlled_failure` jobs fail only attempt 1 for
+  selected indices; others succeed immediately. Compare maximum attempt budgets
+  3 (recovery) and 1 (exhaustion control). Use ordinary equal jitter with base/max
+  1 second; persisted first-retry backoff must be in [0.5, 1] seconds. Seed only
+  fault membership, not runtime jitter or generated UUIDs. Reverse cohort order
+  on alternating repetitions. No broker, scheduler, worker-crash or outage claim.
+- **Bounds:** Defaults are 60 seconds per cohort and 900 seconds per suite;
+  hard limits are 10-1,000 jobs/cohort in multiples of ten, 1-5 repetitions,
+  120 seconds/cohort and 900 seconds/suite. Output directories are exclusive.
+  Preserve partial results and return nonzero on unexpected/incomplete outcomes;
+  expected control dead letters count as successful experiment accounting.
+  Clean up only owned resources on success, failure and interruption.
+- **Measurements:** Derive initial success from attempt-1 history, eventual
+  status, failed attempts, automatic retry intents/executions, attempts per job,
+  application dead letters and successful lifecycle time. For recovered faults,
+  measure first-failure outcome to final-success outcome and reconcile persisted
+  backoff + due-to-next-claim delay + final claim-to-outcome duration. Report
+  nearest-rank p50/p95/p99 with sample counts; absent recovery samples are null.
+  PostgreSQL timestamps precede commits, and client completion includes polling.
+- **Acceptance:** Each recovery cohort has 300 successes, zero dead letters,
+  330 attempts/outboxes and 30 retries; each control has 270 successes, 30 dead
+  letters, 300 attempts/outboxes and no retries. Both have 270 first-attempt
+  successes. Across six runs: 1,800 jobs and 1,890 attempts/outboxes. Reconcile
+  each index/UUID, result, generation, retry due time, final outcome and exhaustion
+  context with PostgreSQL rows; reject extra/missing/duplicate records, early
+  retries and unknown failures. READY outboxes are unpublished durable intent.
+- **Evidence:** Record commands, machine/runtime/image/source and both harness
+  hashes, settings, seed/index-to-UUID mappings, individual timings and all
+  relevant job/attempt/outbox fields. Publish raw evidence and limitations, plus
+  concise CV wording and a local Swagger walkthrough using validated features.
+- **Validation:** Meaningful harness tests for fault schedules, bounds, accounting,
+  timing and failure cleanup; real Docker/HTTP/PostgreSQL smoke and complete
+  repeated experiment; independent raw-result reconciliation; standard virtual
+  environment `python scripts/check.py` with no skips; `alembic check`; final
+  diff/secrets review, documentation and local milestone commit.
+- **Result:** All acceptance counts and timing/accounting checks passed in the
+  six recorded cohorts. Independent raw reconciliation, real success/failure
+  cleanup smokes, 144 new tests, the complete 1,125-test gate and schema drift
+  check passed. Reports retain every expected exhausted control and distinguish
+  controlled handler observations from unmeasured outage/broker/cloud behavior.
+  CV wording and a local Swagger walkthrough are documented in PORTFOLIO.
 
 ## 19 - Optional C++ worker experiment
 
-- **Status:** NOT STARTED (OPTIONAL; gated on 0-18 completion).
+- **Status:** NOT STARTED (OPTIONAL; 0-18 complete, separate explicit approval required).
 - **Objective:** Compare equivalent CPU-bound work only if it adds evidence.
 - **Tasks:** Choose one hashing/prime/transformation workload and equivalent implementations;
   record environment, compiler/runtime options, correctness and raw benchmark results.
@@ -793,10 +852,12 @@ Verification on 2026-10-09:
 - D019: free local demo; GCP provisioning and hosted/billable automation deferred.
 - D020: bounded isolated local benchmarks, raw per-job measurements and explicit
   transaction/polling/resource measurement limitations.
+- D021: seeded controlled-failure cohorts, PostgreSQL retry/dead-letter accounting
+  and explicit recovery timing boundaries.
 
 # Risks / technical debt
 
-- Milestones 0-17's local acceptance checks pass. Cloud IAM/provisioning/delivery
+- Milestones 0-18's local acceptance checks pass. Cloud IAM/provisioning/delivery
   are deferred indefinitely; local tests do not validate cloud behavior.
 - Cloud IAM, broker DLQ operations and dispatcher/scheduler hosting still need
   deployment/reliability decisions. Priority cannot impose global broker execution order.
@@ -831,12 +892,15 @@ Verification on 2026-10-09:
   observed likely constraints; precise profiling, connection/lock wait attribution,
   sustained capacity and fleet scalability are unmeasured. See the report before
   using throughput or latency numbers outside their measured conditions.
+- Reliability measurements cover controlled handler failures on one local host;
+  seeded membership does not fix runtime jitter/timing. Each recovery run has
+  only 30 samples, and precommit/polling timing boundaries prevent SLA claims.
+  Outage/crash/broker/fleet recovery was not measured by milestone 18.
 
 # Next actions
 
-1. Await approval to start milestone 18's bounded local reliability experiment:
-   controlled transient failures, completion/retry/dead-letter/recovery measurements
-   and reconciliation with PostgreSQL attempt history.
+1. Required milestones 0-18 are complete. Use PORTFOLIO's CV bullets and Swagger
+   walkthrough with the committed performance/reliability reports and raw evidence.
 2. Milestone 19 is optional and requires separate explicit approval after milestones
    0-18. It is not required for the CV-ready Python project.
 3. Keep cloud provisioning and hosted/billable automation out of scope.

@@ -27,8 +27,10 @@ the intended completed system unless explicitly identified as a foundation.
 | Quality | pytest, Ruff, mypy, one standard verification command |
 | Operations | Structured logging, useful metrics, reproducible load/failure experiments |
 
-Local metrics use Prometheus text exposition. Local load tests use a bounded
-Python/httpx harness with disposable Docker PostgreSQL/API/worker resources.
+Local metrics use Prometheus text exposition. Local load and reliability tests
+use bounded Python/httpx harnesses with disposable Docker PostgreSQL/API/worker
+resources and already available local images. Reliability observations use
+seeded controlled task failures and PostgreSQL attempt/outbox reconciliation.
 Cloud metrics collection is out of scope.
 Changes to a major framework, database, transport, cloud, or orchestration
 platform require an explicit recorded justification.

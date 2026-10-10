@@ -1,0 +1,1796 @@
+{
+  "format_version": 1,
+  "experiment": "controlled_handler_failure",
+  "started_at": "2026-10-10T12:46:59.360695+00:00",
+  "complete": true,
+  "runs": [
+    {
+      "run_number": 1,
+      "repetition": 1,
+      "cohort": "recovery",
+      "worker_concurrency": 5,
+      "raw_file": "run-01.json",
+      "complete": true,
+      "seed": 20261010,
+      "fault_indices": [
+        1,
+        21,
+        30,
+        43,
+        47,
+        55,
+        85,
+        87,
+        88,
+        98,
+        119,
+        129,
+        131,
+        136,
+        148,
+        150,
+        151,
+        153,
+        163,
+        167,
+        168,
+        176,
+        179,
+        182,
+        201,
+        205,
+        225,
+        232,
+        262,
+        288
+      ],
+      "max_attempts": 3,
+      "summary": {
+        "jobs": 300,
+        "injected_faults": 30,
+        "initially_succeeded": 270,
+        "eventually_succeeded": 300,
+        "dead_lettered": 0,
+        "permanently_failed": 0,
+        "unexpected_failures": 0,
+        "attempts": 330,
+        "failed_attempts": 30,
+        "automatic_retry_intents": 30,
+        "automatic_retry_executions": 30,
+        "automatic_retries": 30,
+        "outbox": 330,
+        "attempts_per_job_mean": 1.1,
+        "attempts_per_job_counts": {
+          "1": 270,
+          "2": 30
+        },
+        "initial_success_rate": 0.9,
+        "eventual_success_rate": 1.0,
+        "dead_letter_rate": 0.0,
+        "failed_attempt_rate": 0.09090909090909091,
+        "generation": 0,
+        "accounting": {
+          "jobs": 300,
+          "injected_faults": 30,
+          "initially_succeeded": 270,
+          "eventually_succeeded": 300,
+          "dead_lettered": 0,
+          "permanently_failed": 0,
+          "unexpected_failures": 0,
+          "attempts": 330,
+          "failed_attempts": 30,
+          "automatic_retry_intents": 30,
+          "automatic_retry_executions": 30,
+          "automatic_retries": 30,
+          "outbox": 330,
+          "attempts_per_job_mean": 1.1,
+          "attempts_per_job_counts": {
+            "1": 270,
+            "2": 30
+          },
+          "initial_success_rate": 0.9,
+          "eventual_success_rate": 1.0,
+          "dead_letter_rate": 0.0,
+          "failed_attempt_rate": 0.09090909090909091,
+          "generation": 0
+        },
+        "window_seconds": 3.9114689999842085,
+        "timing_seconds": {
+          "request": {
+            "count": 300,
+            "p50": 0.02619789997697808,
+            "p95": 0.06420799999614246,
+            "p99": 0.10290929998154752
+          },
+          "successful_lifecycle": {
+            "count": 300,
+            "p50": 1.69967,
+            "p95": 2.660803,
+            "p99": 2.91791
+          },
+          "client_observed_completion": {
+            "count": 300,
+            "p50": 1.7609168000053614,
+            "p95": 2.6953500999952666,
+            "p99": 2.959773300011875
+          },
+          "recovery": {
+            "count": 30,
+            "p50": 0.986986,
+            "p95": 1.583494,
+            "p99": 1.708953
+          },
+          "backoff": {
+            "count": 30,
+            "p50": 0.725618,
+            "p95": 0.956653,
+            "p99": 0.986695
+          },
+          "due_to_claim": {
+            "count": 30,
+            "p50": 0.25214,
+            "p95": 0.825415,
+            "p99": 1.027656
+          },
+          "final_claim_to_outcome": {
+            "count": 30,
+            "p50": 0.011796,
+            "p95": 0.014105,
+            "p99": 0.0145
+          }
+        },
+        "recovery_samples": [
+          {
+            "id": "fcfbff40-da85-4807-885f-0838013a24d6",
+            "submission_index": 1,
+            "recovery": 1.708953,
+            "backoff": 0.956653,
+            "due_to_claim": 0.740184,
+            "final_claim_to_outcome": 0.012116
+          },
+          {
+            "id": "2cdeee10-a12c-4c7d-81b7-344db5ac7dca",
+            "submission_index": 21,
+            "recovery": 1.583494,
+            "backoff": 0.746234,
+            "due_to_claim": 0.825415,
+            "final_claim_to_outcome": 0.011845
+          },
+          {
+            "id": "abbdcb98-bf87-48aa-8d8e-12d38629add9",
+            "submission_index": 30,
+            "recovery": 1.545506,
+            "backoff": 0.506034,
+            "due_to_claim": 1.027656,
+            "final_claim_to_outcome": 0.011816
+          },
+          {
+            "id": "b2f09f02-eceb-4a89-99ba-afc72b21000a",
+            "submission_index": 43,
+            "recovery": 1.508729,
+            "backoff": 0.917068,
+            "due_to_claim": 0.579606,
+            "final_claim_to_outcome": 0.012055
+          },
+          {
+            "id": "63691cf4-2013-4e2e-a457-bc41c5b08e9f",
+            "submission_index": 47,
+            "recovery": 1.451188,
+            "backoff": 0.986695,
+            "due_to_claim": 0.452215,
+            "final_claim_to_outcome": 0.012278
+          },
+          {
+            "id": "1cdb0f10-ba5c-418a-9574-e5354570e3a6",
+            "submission_index": 55,
+            "recovery": 1.342834,
+            "backoff": 0.522152,
+            "due_to_claim": 0.808886,
+            "final_claim_to_outcome": 0.011796
+          },
+          {
+            "id": "b8d9bf78-5b20-4ae6-840e-12b5027959e6",
+            "submission_index": 85,
+            "recovery": 1.280982,
+            "backoff": 0.825612,
+            "due_to_claim": 0.444162,
+            "final_claim_to_outcome": 0.011208
+          },
+          {
+            "id": "81892a16-7266-4380-b2e3-d6a5539a719b",
+            "submission_index": 87,
+            "recovery": 1.232369,
+            "backoff": 0.64025,
+            "due_to_claim": 0.580239,
+            "final_claim_to_outcome": 0.01188
+          },
+          {
+            "id": "2a378ad2-434a-4b74-8006-039b77eb455b",
+            "submission_index": 88,
+            "recovery": 1.233557,
+            "backoff": 0.731227,
+            "due_to_claim": 0.491152,
+            "final_claim_to_outcome": 0.011178
+          },
+          {
+            "id": "22efbe44-208c-4088-ab47-a80a3d99392b",
+            "submission_index": 98,
+            "recovery": 1.191661,
+            "backoff": 0.676035,
+            "due_to_claim": 0.503122,
+            "final_claim_to_outcome": 0.012504
+          },
+          {
+            "id": "96a51e06-a2e4-4ef9-99c3-124bd3161b59",
+            "submission_index": 119,
+            "recovery": 1.064616,
+            "backoff": 0.725618,
+            "due_to_claim": 0.326868,
+            "final_claim_to_outcome": 0.01213
+          },
+          {
+            "id": "95bcf278-d36c-4b7a-a518-fe038ac7dfd9",
+            "submission_index": 129,
+            "recovery": 1.050411,
+            "backoff": 0.609153,
+            "due_to_claim": 0.429431,
+            "final_claim_to_outcome": 0.011827
+          },
+          {
+            "id": "c8ba545b-1e4c-4353-bd73-bb96bf205ffa",
+            "submission_index": 131,
+            "recovery": 1.063278,
+            "backoff": 0.645463,
+            "due_to_claim": 0.40481,
+            "final_claim_to_outcome": 0.013005
+          },
+          {
+            "id": "20314950-ed05-430b-8242-423cfbb0fbe9",
+            "submission_index": 136,
+            "recovery": 1.052954,
+            "backoff": 0.79269,
+            "due_to_claim": 0.246159,
+            "final_claim_to_outcome": 0.014105
+          },
+          {
+            "id": "210c7425-ae0a-45e6-8b4e-5f257533bb7f",
+            "submission_index": 148,
+            "recovery": 0.941855,
+            "backoff": 0.520279,
+            "due_to_claim": 0.410656,
+            "final_claim_to_outcome": 0.01092
+          },
+          {
+            "id": "64c6b9df-beb2-4d0f-b79d-1149e4ee5551",
+            "submission_index": 150,
+            "recovery": 0.990765,
+            "backoff": 0.765806,
+            "due_to_claim": 0.212978,
+            "final_claim_to_outcome": 0.011981
+          },
+          {
+            "id": "cfa577b7-650c-4c68-99ef-b19bf0523a0d",
+            "submission_index": 151,
+            "recovery": 0.961963,
+            "backoff": 0.695323,
+            "due_to_claim": 0.25214,
+            "final_claim_to_outcome": 0.0145
+          },
+          {
+            "id": "c3119a4e-a08c-4533-afb5-8a3f4a9875e6",
+            "submission_index": 153,
+            "recovery": 0.986986,
+            "backoff": 0.922349,
+            "due_to_claim": 0.053915,
+            "final_claim_to_outcome": 0.010722
+          },
+          {
+            "id": "b0693d74-c078-4b0a-94c4-a14ce2779c9d",
+            "submission_index": 163,
+            "recovery": 0.869875,
+            "backoff": 0.60436,
+            "due_to_claim": 0.252565,
+            "final_claim_to_outcome": 0.01295
+          },
+          {
+            "id": "fdb6e0a1-5bad-4582-90c1-01c647640abf",
+            "submission_index": 167,
+            "recovery": 0.958465,
+            "backoff": 0.906023,
+            "due_to_claim": 0.044841,
+            "final_claim_to_outcome": 0.007601
+          },
+          {
+            "id": "c0c0f392-1361-4087-9368-e4c447d12697",
+            "submission_index": 168,
+            "recovery": 0.867086,
+            "backoff": 0.724429,
+            "due_to_claim": 0.131206,
+            "final_claim_to_outcome": 0.011451
+          },
+          {
+            "id": "680f4618-ec81-4886-aae3-c70067936626",
+            "submission_index": 176,
+            "recovery": 0.825013,
+            "backoff": 0.806515,
+            "due_to_claim": 0.01013,
+            "final_claim_to_outcome": 0.008368
+          },
+          {
+            "id": "9ba2a33f-5cd2-4669-a29c-fe9e126d88a9",
+            "submission_index": 179,
+            "recovery": 0.81742,
+            "backoff": 0.754043,
+            "due_to_claim": 0.052723,
+            "final_claim_to_outcome": 0.010654
+          },
+          {
+            "id": "d6d1b490-af46-4b38-94c6-24bc83ed3622",
+            "submission_index": 182,
+            "recovery": 0.785573,
+            "backoff": 0.599551,
+            "due_to_claim": 0.17418,
+            "final_claim_to_outcome": 0.011842
+          },
+          {
+            "id": "525307a2-c53e-4813-994e-b2b2493d8ae9",
+            "submission_index": 201,
+            "recovery": 0.875236,
+            "backoff": 0.851753,
+            "due_to_claim": 0.015537,
+            "final_claim_to_outcome": 0.007946
+          },
+          {
+            "id": "02f111b8-91c4-49ec-afb0-786619bf0080",
+            "submission_index": 205,
+            "recovery": 0.664485,
+            "backoff": 0.538864,
+            "due_to_claim": 0.113985,
+            "final_claim_to_outcome": 0.011636
+          },
+          {
+            "id": "9a6a8435-7832-4761-9937-dd10a9e64372",
+            "submission_index": 225,
+            "recovery": 0.884842,
+            "backoff": 0.830052,
+            "due_to_claim": 0.047299,
+            "final_claim_to_outcome": 0.007491
+          },
+          {
+            "id": "54ff134f-05c6-4c67-99e8-ea169d573cd5",
+            "submission_index": 232,
+            "recovery": 0.718475,
+            "backoff": 0.697252,
+            "due_to_claim": 0.014254,
+            "final_claim_to_outcome": 0.006969
+          },
+          {
+            "id": "e10b32d6-6560-467b-ada8-393cafa28bca",
+            "submission_index": 262,
+            "recovery": 0.606186,
+            "backoff": 0.58003,
+            "due_to_claim": 0.019331,
+            "final_claim_to_outcome": 0.006825
+          },
+          {
+            "id": "2ee485dc-8999-4e46-90a3-ea5253246099",
+            "submission_index": 288,
+            "recovery": 0.932005,
+            "backoff": 0.871071,
+            "due_to_claim": 0.05338,
+            "final_claim_to_outcome": 0.007554
+          }
+        ]
+      }
+    },
+    {
+      "run_number": 2,
+      "repetition": 1,
+      "cohort": "exhaustion_control",
+      "worker_concurrency": 5,
+      "raw_file": "run-02.json",
+      "complete": true,
+      "seed": 20261010,
+      "fault_indices": [
+        1,
+        21,
+        30,
+        43,
+        47,
+        55,
+        85,
+        87,
+        88,
+        98,
+        119,
+        129,
+        131,
+        136,
+        148,
+        150,
+        151,
+        153,
+        163,
+        167,
+        168,
+        176,
+        179,
+        182,
+        201,
+        205,
+        225,
+        232,
+        262,
+        288
+      ],
+      "max_attempts": 1,
+      "summary": {
+        "jobs": 300,
+        "injected_faults": 30,
+        "initially_succeeded": 270,
+        "eventually_succeeded": 270,
+        "dead_lettered": 30,
+        "permanently_failed": 0,
+        "unexpected_failures": 0,
+        "attempts": 300,
+        "failed_attempts": 30,
+        "automatic_retry_intents": 0,
+        "automatic_retry_executions": 0,
+        "automatic_retries": 0,
+        "outbox": 300,
+        "attempts_per_job_mean": 1.0,
+        "attempts_per_job_counts": {
+          "1": 300,
+          "2": 0
+        },
+        "initial_success_rate": 0.9,
+        "eventual_success_rate": 0.9,
+        "dead_letter_rate": 0.1,
+        "failed_attempt_rate": 0.1,
+        "generation": 0,
+        "accounting": {
+          "jobs": 300,
+          "injected_faults": 30,
+          "initially_succeeded": 270,
+          "eventually_succeeded": 270,
+          "dead_lettered": 30,
+          "permanently_failed": 0,
+          "unexpected_failures": 0,
+          "attempts": 300,
+          "failed_attempts": 30,
+          "automatic_retry_intents": 0,
+          "automatic_retry_executions": 0,
+          "automatic_retries": 0,
+          "outbox": 300,
+          "attempts_per_job_mean": 1.0,
+          "attempts_per_job_counts": {
+            "1": 300,
+            "2": 0
+          },
+          "initial_success_rate": 0.9,
+          "eventual_success_rate": 0.9,
+          "dead_letter_rate": 0.1,
+          "failed_attempt_rate": 0.1,
+          "generation": 0
+        },
+        "window_seconds": 3.0328877000138164,
+        "timing_seconds": {
+          "request": {
+            "count": 300,
+            "p50": 0.027010499994503334,
+            "p95": 0.07068490001256578,
+            "p99": 0.1179755000048317
+          },
+          "successful_lifecycle": {
+            "count": 270,
+            "p50": 1.621433,
+            "p95": 1.934289,
+            "p99": 1.960849
+          },
+          "client_observed_completion": {
+            "count": 300,
+            "p50": 1.684129800007213,
+            "p95": 1.99072729999898,
+            "p99": 2.0427856000023894
+          },
+          "recovery": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "backoff": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "due_to_claim": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "final_claim_to_outcome": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          }
+        },
+        "recovery_samples": []
+      }
+    },
+    {
+      "run_number": 3,
+      "repetition": 2,
+      "cohort": "exhaustion_control",
+      "worker_concurrency": 5,
+      "raw_file": "run-03.json",
+      "complete": true,
+      "seed": 20261011,
+      "fault_indices": [
+        1,
+        7,
+        8,
+        13,
+        19,
+        20,
+        28,
+        65,
+        71,
+        77,
+        99,
+        111,
+        117,
+        123,
+        131,
+        142,
+        149,
+        173,
+        176,
+        177,
+        179,
+        183,
+        189,
+        213,
+        232,
+        241,
+        245,
+        251,
+        253,
+        271
+      ],
+      "max_attempts": 1,
+      "summary": {
+        "jobs": 300,
+        "injected_faults": 30,
+        "initially_succeeded": 270,
+        "eventually_succeeded": 270,
+        "dead_lettered": 30,
+        "permanently_failed": 0,
+        "unexpected_failures": 0,
+        "attempts": 300,
+        "failed_attempts": 30,
+        "automatic_retry_intents": 0,
+        "automatic_retry_executions": 0,
+        "automatic_retries": 0,
+        "outbox": 300,
+        "attempts_per_job_mean": 1.0,
+        "attempts_per_job_counts": {
+          "1": 300,
+          "2": 0
+        },
+        "initial_success_rate": 0.9,
+        "eventual_success_rate": 0.9,
+        "dead_letter_rate": 0.1,
+        "failed_attempt_rate": 0.1,
+        "generation": 0,
+        "accounting": {
+          "jobs": 300,
+          "injected_faults": 30,
+          "initially_succeeded": 270,
+          "eventually_succeeded": 270,
+          "dead_lettered": 30,
+          "permanently_failed": 0,
+          "unexpected_failures": 0,
+          "attempts": 300,
+          "failed_attempts": 30,
+          "automatic_retry_intents": 0,
+          "automatic_retry_executions": 0,
+          "automatic_retries": 0,
+          "outbox": 300,
+          "attempts_per_job_mean": 1.0,
+          "attempts_per_job_counts": {
+            "1": 300,
+            "2": 0
+          },
+          "initial_success_rate": 0.9,
+          "eventual_success_rate": 0.9,
+          "dead_letter_rate": 0.1,
+          "failed_attempt_rate": 0.1,
+          "generation": 0
+        },
+        "window_seconds": 3.0284997999842744,
+        "timing_seconds": {
+          "request": {
+            "count": 300,
+            "p50": 0.02938180000637658,
+            "p95": 0.0715014000015799,
+            "p99": 0.10596119999536313
+          },
+          "successful_lifecycle": {
+            "count": 270,
+            "p50": 1.645586,
+            "p95": 1.960499,
+            "p99": 1.993266
+          },
+          "client_observed_completion": {
+            "count": 300,
+            "p50": 1.6924544000066817,
+            "p95": 1.9966847999894526,
+            "p99": 2.0324422999983653
+          },
+          "recovery": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "backoff": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "due_to_claim": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "final_claim_to_outcome": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          }
+        },
+        "recovery_samples": []
+      }
+    },
+    {
+      "run_number": 4,
+      "repetition": 2,
+      "cohort": "recovery",
+      "worker_concurrency": 5,
+      "raw_file": "run-04.json",
+      "complete": true,
+      "seed": 20261011,
+      "fault_indices": [
+        1,
+        7,
+        8,
+        13,
+        19,
+        20,
+        28,
+        65,
+        71,
+        77,
+        99,
+        111,
+        117,
+        123,
+        131,
+        142,
+        149,
+        173,
+        176,
+        177,
+        179,
+        183,
+        189,
+        213,
+        232,
+        241,
+        245,
+        251,
+        253,
+        271
+      ],
+      "max_attempts": 3,
+      "summary": {
+        "jobs": 300,
+        "injected_faults": 30,
+        "initially_succeeded": 270,
+        "eventually_succeeded": 300,
+        "dead_lettered": 0,
+        "permanently_failed": 0,
+        "unexpected_failures": 0,
+        "attempts": 330,
+        "failed_attempts": 30,
+        "automatic_retry_intents": 30,
+        "automatic_retry_executions": 30,
+        "automatic_retries": 30,
+        "outbox": 330,
+        "attempts_per_job_mean": 1.1,
+        "attempts_per_job_counts": {
+          "1": 270,
+          "2": 30
+        },
+        "initial_success_rate": 0.9,
+        "eventual_success_rate": 1.0,
+        "dead_letter_rate": 0.0,
+        "failed_attempt_rate": 0.09090909090909091,
+        "generation": 0,
+        "accounting": {
+          "jobs": 300,
+          "injected_faults": 30,
+          "initially_succeeded": 270,
+          "eventually_succeeded": 300,
+          "dead_lettered": 0,
+          "permanently_failed": 0,
+          "unexpected_failures": 0,
+          "attempts": 330,
+          "failed_attempts": 30,
+          "automatic_retry_intents": 30,
+          "automatic_retry_executions": 30,
+          "automatic_retries": 30,
+          "outbox": 330,
+          "attempts_per_job_mean": 1.1,
+          "attempts_per_job_counts": {
+            "1": 270,
+            "2": 30
+          },
+          "initial_success_rate": 0.9,
+          "eventual_success_rate": 1.0,
+          "dead_letter_rate": 0.0,
+          "failed_attempt_rate": 0.09090909090909091,
+          "generation": 0
+        },
+        "window_seconds": 3.7826189000043087,
+        "timing_seconds": {
+          "request": {
+            "count": 300,
+            "p50": 0.026547899993602186,
+            "p95": 0.07022080000024289,
+            "p99": 0.13105130000622012
+          },
+          "successful_lifecycle": {
+            "count": 300,
+            "p50": 1.774162,
+            "p95": 2.814125,
+            "p99": 3.041586
+          },
+          "client_observed_completion": {
+            "count": 300,
+            "p50": 1.8392823999747634,
+            "p95": 2.8570518999767955,
+            "p99": 3.10021579999011
+          },
+          "recovery": {
+            "count": 30,
+            "p50": 1.015293,
+            "p95": 1.739499,
+            "p99": 1.740697
+          },
+          "backoff": {
+            "count": 30,
+            "p50": 0.730053,
+            "p95": 0.986226,
+            "p99": 0.995101
+          },
+          "due_to_claim": {
+            "count": 30,
+            "p50": 0.267319,
+            "p95": 0.898563,
+            "p99": 0.922833
+          },
+          "final_claim_to_outcome": {
+            "count": 30,
+            "p50": 0.011316,
+            "p95": 0.014406,
+            "p99": 0.014421
+          }
+        },
+        "recovery_samples": [
+          {
+            "id": "b830e0ec-5a7b-46ee-92fa-d986336cefbb",
+            "submission_index": 1,
+            "recovery": 1.740697,
+            "backoff": 0.995101,
+            "due_to_claim": 0.735502,
+            "final_claim_to_outcome": 0.010094
+          },
+          {
+            "id": "91f63997-cc3b-4dd7-a722-2c7bcd201769",
+            "submission_index": 7,
+            "recovery": 1.739499,
+            "backoff": 0.986226,
+            "due_to_claim": 0.738867,
+            "final_claim_to_outcome": 0.014406
+          },
+          {
+            "id": "605cbfc0-97bf-4b1e-9cef-80bfc8b24de3",
+            "submission_index": 8,
+            "recovery": 1.681414,
+            "backoff": 0.852415,
+            "due_to_claim": 0.816593,
+            "final_claim_to_outcome": 0.012406
+          },
+          {
+            "id": "7b0a694e-6a9c-47a5-9573-5f67af745339",
+            "submission_index": 13,
+            "recovery": 1.676896,
+            "backoff": 0.765263,
+            "due_to_claim": 0.898563,
+            "final_claim_to_outcome": 0.01307
+          },
+          {
+            "id": "cba1e886-790e-422b-94d0-38638facb2c7",
+            "submission_index": 19,
+            "recovery": 1.615055,
+            "backoff": 0.677801,
+            "due_to_claim": 0.922833,
+            "final_claim_to_outcome": 0.014421
+          },
+          {
+            "id": "133c9222-2f7a-4da7-afda-be4fc9f2608a",
+            "submission_index": 20,
+            "recovery": 1.613431,
+            "backoff": 0.83152,
+            "due_to_claim": 0.768013,
+            "final_claim_to_outcome": 0.013898
+          },
+          {
+            "id": "41b77c97-ed54-452b-8f79-1aadf09e82e0",
+            "submission_index": 28,
+            "recovery": 1.558973,
+            "backoff": 0.654308,
+            "due_to_claim": 0.892281,
+            "final_claim_to_outcome": 0.012384
+          },
+          {
+            "id": "5b006080-c81a-4efc-8881-5e55ac61de31",
+            "submission_index": 65,
+            "recovery": 1.378135,
+            "backoff": 0.635048,
+            "due_to_claim": 0.731628,
+            "final_claim_to_outcome": 0.011459
+          },
+          {
+            "id": "5d0d1c40-9a01-497c-8713-4a06ed02e696",
+            "submission_index": 71,
+            "recovery": 1.362438,
+            "backoff": 0.63775,
+            "due_to_claim": 0.713221,
+            "final_claim_to_outcome": 0.011467
+          },
+          {
+            "id": "dd9a334d-9813-497d-910a-80560bc65212",
+            "submission_index": 77,
+            "recovery": 1.306506,
+            "backoff": 0.500282,
+            "due_to_claim": 0.794908,
+            "final_claim_to_outcome": 0.011316
+          },
+          {
+            "id": "90480560-771a-40e7-9f12-1bd5fcfb70ce",
+            "submission_index": 99,
+            "recovery": 1.212795,
+            "backoff": 0.674166,
+            "due_to_claim": 0.526221,
+            "final_claim_to_outcome": 0.012408
+          },
+          {
+            "id": "496cade6-6f72-4329-9f9d-fbf8590504a3",
+            "submission_index": 111,
+            "recovery": 1.151182,
+            "backoff": 0.729997,
+            "due_to_claim": 0.410184,
+            "final_claim_to_outcome": 0.011001
+          },
+          {
+            "id": "fe413a7a-fbfa-4e6e-a073-63e515005c8a",
+            "submission_index": 117,
+            "recovery": 1.13781,
+            "backoff": 0.858358,
+            "due_to_claim": 0.267319,
+            "final_claim_to_outcome": 0.012133
+          },
+          {
+            "id": "05b1c299-1995-44b7-8270-0764cea97e3b",
+            "submission_index": 123,
+            "recovery": 1.109191,
+            "backoff": 0.780295,
+            "due_to_claim": 0.316936,
+            "final_claim_to_outcome": 0.01196
+          },
+          {
+            "id": "afe7c3fd-19dd-465e-bcd1-1a8756f7b79d",
+            "submission_index": 131,
+            "recovery": 1.077921,
+            "backoff": 0.735966,
+            "due_to_claim": 0.329543,
+            "final_claim_to_outcome": 0.012412
+          },
+          {
+            "id": "8afcb59d-30ae-4ad0-b07b-55ca64348fda",
+            "submission_index": 142,
+            "recovery": 0.994066,
+            "backoff": 0.620132,
+            "due_to_claim": 0.3626,
+            "final_claim_to_outcome": 0.011334
+          },
+          {
+            "id": "e7936334-cb29-419e-af8e-20f9f7070f89",
+            "submission_index": 149,
+            "recovery": 0.987375,
+            "backoff": 0.715921,
+            "due_to_claim": 0.258768,
+            "final_claim_to_outcome": 0.012686
+          },
+          {
+            "id": "db3f1706-5911-4114-a49e-1ca34879b91b",
+            "submission_index": 173,
+            "recovery": 1.015293,
+            "backoff": 0.979289,
+            "due_to_claim": 0.030396,
+            "final_claim_to_outcome": 0.005608
+          },
+          {
+            "id": "f28cd902-1e64-4860-8c81-0608d1401ea2",
+            "submission_index": 176,
+            "recovery": 0.897755,
+            "backoff": 0.871297,
+            "due_to_claim": 0.015611,
+            "final_claim_to_outcome": 0.010847
+          },
+          {
+            "id": "aaa6de0d-3d58-4fc2-b2c6-f0b471c359ae",
+            "submission_index": 177,
+            "recovery": 0.891024,
+            "backoff": 0.835944,
+            "due_to_claim": 0.044108,
+            "final_claim_to_outcome": 0.010972
+          },
+          {
+            "id": "994ddd82-098d-4b9e-b67e-ea1aeb309488",
+            "submission_index": 179,
+            "recovery": 0.806859,
+            "backoff": 0.598496,
+            "due_to_claim": 0.19664,
+            "final_claim_to_outcome": 0.011723
+          },
+          {
+            "id": "61785b5a-b86a-4113-b33d-0a80972e0ab5",
+            "submission_index": 183,
+            "recovery": 0.783071,
+            "backoff": 0.573471,
+            "due_to_claim": 0.199472,
+            "final_claim_to_outcome": 0.010128
+          },
+          {
+            "id": "2755cedd-a7c9-4901-8656-fc6d5289e6e1",
+            "submission_index": 189,
+            "recovery": 0.814773,
+            "backoff": 0.800172,
+            "due_to_claim": 0.005015,
+            "final_claim_to_outcome": 0.009586
+          },
+          {
+            "id": "1522d920-c9d1-422c-bbea-293b2980981d",
+            "submission_index": 213,
+            "recovery": 0.633492,
+            "backoff": 0.624788,
+            "due_to_claim": 0.00209,
+            "final_claim_to_outcome": 0.006614
+          },
+          {
+            "id": "16bf59c7-c8f9-4dba-88d3-5ad39bdd35ff",
+            "submission_index": 232,
+            "recovery": 0.695678,
+            "backoff": 0.654967,
+            "due_to_claim": 0.034502,
+            "final_claim_to_outcome": 0.006209
+          },
+          {
+            "id": "91af1519-2bd7-44c2-ae2f-bbbb0e16f16c",
+            "submission_index": 241,
+            "recovery": 0.943998,
+            "backoff": 0.907897,
+            "due_to_claim": 0.028534,
+            "final_claim_to_outcome": 0.007567
+          },
+          {
+            "id": "c57729da-74c9-499a-aa3a-1d3f32ac4595",
+            "submission_index": 245,
+            "recovery": 0.867756,
+            "backoff": 0.842229,
+            "due_to_claim": 0.016466,
+            "final_claim_to_outcome": 0.009061
+          },
+          {
+            "id": "4d8e5a20-5269-4c62-8e1d-4929d88464df",
+            "submission_index": 251,
+            "recovery": 0.662351,
+            "backoff": 0.644528,
+            "due_to_claim": 0.011944,
+            "final_claim_to_outcome": 0.005879
+          },
+          {
+            "id": "965b38d2-47a1-40c3-8b52-a525ddfff014",
+            "submission_index": 253,
+            "recovery": 0.94685,
+            "backoff": 0.899067,
+            "due_to_claim": 0.04155,
+            "final_claim_to_outcome": 0.006233
+          },
+          {
+            "id": "06b739ea-bb96-40d0-aef6-d527af52ef7b",
+            "submission_index": 271,
+            "recovery": 0.766765,
+            "backoff": 0.730053,
+            "due_to_claim": 0.026804,
+            "final_claim_to_outcome": 0.009908
+          }
+        ]
+      }
+    },
+    {
+      "run_number": 5,
+      "repetition": 3,
+      "cohort": "recovery",
+      "worker_concurrency": 5,
+      "raw_file": "run-05.json",
+      "complete": true,
+      "seed": 20261012,
+      "fault_indices": [
+        0,
+        4,
+        22,
+        25,
+        32,
+        35,
+        38,
+        42,
+        48,
+        58,
+        65,
+        87,
+        113,
+        117,
+        119,
+        141,
+        149,
+        161,
+        175,
+        201,
+        208,
+        223,
+        230,
+        271,
+        276,
+        279,
+        284,
+        286,
+        287,
+        294
+      ],
+      "max_attempts": 3,
+      "summary": {
+        "jobs": 300,
+        "injected_faults": 30,
+        "initially_succeeded": 270,
+        "eventually_succeeded": 300,
+        "dead_lettered": 0,
+        "permanently_failed": 0,
+        "unexpected_failures": 0,
+        "attempts": 330,
+        "failed_attempts": 30,
+        "automatic_retry_intents": 30,
+        "automatic_retry_executions": 30,
+        "automatic_retries": 30,
+        "outbox": 330,
+        "attempts_per_job_mean": 1.1,
+        "attempts_per_job_counts": {
+          "1": 270,
+          "2": 30
+        },
+        "initial_success_rate": 0.9,
+        "eventual_success_rate": 1.0,
+        "dead_letter_rate": 0.0,
+        "failed_attempt_rate": 0.09090909090909091,
+        "generation": 0,
+        "accounting": {
+          "jobs": 300,
+          "injected_faults": 30,
+          "initially_succeeded": 270,
+          "eventually_succeeded": 300,
+          "dead_lettered": 0,
+          "permanently_failed": 0,
+          "unexpected_failures": 0,
+          "attempts": 330,
+          "failed_attempts": 30,
+          "automatic_retry_intents": 30,
+          "automatic_retry_executions": 30,
+          "automatic_retries": 30,
+          "outbox": 330,
+          "attempts_per_job_mean": 1.1,
+          "attempts_per_job_counts": {
+            "1": 270,
+            "2": 30
+          },
+          "initial_success_rate": 0.9,
+          "eventual_success_rate": 1.0,
+          "dead_letter_rate": 0.0,
+          "failed_attempt_rate": 0.09090909090909091,
+          "generation": 0
+        },
+        "window_seconds": 3.9012744999781717,
+        "timing_seconds": {
+          "request": {
+            "count": 300,
+            "p50": 0.027266899996902794,
+            "p95": 0.05979590001516044,
+            "p99": 0.08843679999699816
+          },
+          "successful_lifecycle": {
+            "count": 300,
+            "p50": 1.709476,
+            "p95": 2.849228,
+            "p99": 2.969615
+          },
+          "client_observed_completion": {
+            "count": 300,
+            "p50": 1.7616041000001132,
+            "p95": 2.8886618000105955,
+            "p99": 3.023106699984055
+          },
+          "recovery": {
+            "count": 30,
+            "p50": 1.011686,
+            "p95": 1.725914,
+            "p99": 1.729873
+          },
+          "backoff": {
+            "count": 30,
+            "p50": 0.785918,
+            "p95": 0.955524,
+            "p99": 0.97358
+          },
+          "due_to_claim": {
+            "count": 30,
+            "p50": 0.156262,
+            "p95": 0.975321,
+            "p99": 0.987871
+          },
+          "final_claim_to_outcome": {
+            "count": 30,
+            "p50": 0.011524,
+            "p95": 0.01319,
+            "p99": 0.013678
+          }
+        },
+        "recovery_samples": [
+          {
+            "id": "d81b53e5-aecc-400a-b0bf-0c151547524d",
+            "submission_index": 0,
+            "recovery": 1.725914,
+            "backoff": 0.738906,
+            "due_to_claim": 0.975321,
+            "final_claim_to_outcome": 0.011687
+          },
+          {
+            "id": "f5330a56-1458-4c4a-b00e-f2a43498903a",
+            "submission_index": 4,
+            "recovery": 1.729873,
+            "backoff": 0.845621,
+            "due_to_claim": 0.872317,
+            "final_claim_to_outcome": 0.011935
+          },
+          {
+            "id": "e7369c6d-1a36-4d40-86d5-a59f9f32196e",
+            "submission_index": 22,
+            "recovery": 1.63188,
+            "backoff": 0.820577,
+            "due_to_claim": 0.799171,
+            "final_claim_to_outcome": 0.012132
+          },
+          {
+            "id": "a4656ca9-22f4-4a80-ac59-ace4b4e8b7ae",
+            "submission_index": 25,
+            "recovery": 1.594962,
+            "backoff": 0.778328,
+            "due_to_claim": 0.802956,
+            "final_claim_to_outcome": 0.013678
+          },
+          {
+            "id": "1609a40d-eeb3-4bf6-bdce-e6acb159eff9",
+            "submission_index": 32,
+            "recovery": 1.561592,
+            "backoff": 0.561559,
+            "due_to_claim": 0.987871,
+            "final_claim_to_outcome": 0.012162
+          },
+          {
+            "id": "79525ca1-44ff-4255-a3fb-9c46d652f5f3",
+            "submission_index": 35,
+            "recovery": 1.557154,
+            "backoff": 0.895243,
+            "due_to_claim": 0.6496,
+            "final_claim_to_outcome": 0.012311
+          },
+          {
+            "id": "9fd12135-bc30-4195-9944-bbe6f5ceda57",
+            "submission_index": 38,
+            "recovery": 1.542984,
+            "backoff": 0.752789,
+            "due_to_claim": 0.777453,
+            "final_claim_to_outcome": 0.012742
+          },
+          {
+            "id": "7752d9fc-22fe-44b1-a606-571020cb5147",
+            "submission_index": 42,
+            "recovery": 1.535205,
+            "backoff": 0.949127,
+            "due_to_claim": 0.57383,
+            "final_claim_to_outcome": 0.012248
+          },
+          {
+            "id": "6ceeac0f-62a7-4ff5-ae2f-d0a64120a7fc",
+            "submission_index": 48,
+            "recovery": 1.393538,
+            "backoff": 0.785918,
+            "due_to_claim": 0.595922,
+            "final_claim_to_outcome": 0.011698
+          },
+          {
+            "id": "8ec1375c-56d4-4bf3-8bcc-2f341fa5032a",
+            "submission_index": 58,
+            "recovery": 1.408983,
+            "backoff": 0.520279,
+            "due_to_claim": 0.876431,
+            "final_claim_to_outcome": 0.012273
+          },
+          {
+            "id": "1f6c7092-19ea-4e01-8761-17786281f779",
+            "submission_index": 65,
+            "recovery": 1.39644,
+            "backoff": 0.54799,
+            "due_to_claim": 0.837333,
+            "final_claim_to_outcome": 0.011117
+          },
+          {
+            "id": "207d8d12-f5a2-44a0-9660-032278b60d2f",
+            "submission_index": 87,
+            "recovery": 1.293243,
+            "backoff": 0.845811,
+            "due_to_claim": 0.435095,
+            "final_claim_to_outcome": 0.012337
+          },
+          {
+            "id": "b92d4dc4-3b41-4a4d-a70b-8ab93997bd0a",
+            "submission_index": 113,
+            "recovery": 1.147679,
+            "backoff": 0.63409,
+            "due_to_claim": 0.50053,
+            "final_claim_to_outcome": 0.013059
+          },
+          {
+            "id": "e573b437-744a-41df-9fd8-ecec8aaef892",
+            "submission_index": 117,
+            "recovery": 1.130411,
+            "backoff": 0.703128,
+            "due_to_claim": 0.414093,
+            "final_claim_to_outcome": 0.01319
+          },
+          {
+            "id": "3a94b72a-8259-4462-9512-a048a539cfdf",
+            "submission_index": 119,
+            "recovery": 1.095035,
+            "backoff": 0.926273,
+            "due_to_claim": 0.156262,
+            "final_claim_to_outcome": 0.0125
+          },
+          {
+            "id": "5a4bb083-7611-45e5-a885-c9882c22cf46",
+            "submission_index": 141,
+            "recovery": 1.001364,
+            "backoff": 0.673224,
+            "due_to_claim": 0.316546,
+            "final_claim_to_outcome": 0.011594
+          },
+          {
+            "id": "11ebccc3-4278-4e7e-a164-9e1a8f642d73",
+            "submission_index": 149,
+            "recovery": 0.983227,
+            "backoff": 0.828231,
+            "due_to_claim": 0.1438,
+            "final_claim_to_outcome": 0.011196
+          },
+          {
+            "id": "c0c184d4-3466-4ac6-8594-805a4141e8e0",
+            "submission_index": 161,
+            "recovery": 0.892291,
+            "backoff": 0.769445,
+            "due_to_claim": 0.111322,
+            "final_claim_to_outcome": 0.011524
+          },
+          {
+            "id": "45440fc6-0568-408a-96d1-aef830075187",
+            "submission_index": 175,
+            "recovery": 0.996286,
+            "backoff": 0.955524,
+            "due_to_claim": 0.032263,
+            "final_claim_to_outcome": 0.008499
+          },
+          {
+            "id": "fd76b10e-2bd8-4126-b3b7-60b6bafbf9b8",
+            "submission_index": 201,
+            "recovery": 0.866843,
+            "backoff": 0.830701,
+            "due_to_claim": 0.027776,
+            "final_claim_to_outcome": 0.008366
+          },
+          {
+            "id": "4e2bc390-aed4-4d34-bd09-b0e282d6aa5f",
+            "submission_index": 208,
+            "recovery": 1.011319,
+            "backoff": 0.97358,
+            "due_to_claim": 0.031717,
+            "final_claim_to_outcome": 0.006022
+          },
+          {
+            "id": "d00e80ee-8687-4660-acd7-0bfda39d0e0e",
+            "submission_index": 223,
+            "recovery": 0.617668,
+            "backoff": 0.605221,
+            "due_to_claim": 0.005029,
+            "final_claim_to_outcome": 0.007418
+          },
+          {
+            "id": "9e6931c3-d811-4627-9b47-d735079974ad",
+            "submission_index": 230,
+            "recovery": 1.011686,
+            "backoff": 0.952302,
+            "due_to_claim": 0.053172,
+            "final_claim_to_outcome": 0.006212
+          },
+          {
+            "id": "ca7063d3-ff52-4f7a-adfb-66ebf1e243e3",
+            "submission_index": 271,
+            "recovery": 0.777316,
+            "backoff": 0.743847,
+            "due_to_claim": 0.026991,
+            "final_claim_to_outcome": 0.006478
+          },
+          {
+            "id": "58d7a36f-07bf-4efc-b44a-bd04c627370b",
+            "submission_index": 276,
+            "recovery": 0.916794,
+            "backoff": 0.890226,
+            "due_to_claim": 0.018195,
+            "final_claim_to_outcome": 0.008373
+          },
+          {
+            "id": "2412837f-d4a7-41d6-ad1d-f977ede2a4b1",
+            "submission_index": 279,
+            "recovery": 0.707953,
+            "backoff": 0.664488,
+            "due_to_claim": 0.034998,
+            "final_claim_to_outcome": 0.008467
+          },
+          {
+            "id": "57febdff-d9c3-44cc-80ec-d1a52c41543c",
+            "submission_index": 284,
+            "recovery": 0.842478,
+            "backoff": 0.818664,
+            "due_to_claim": 0.018761,
+            "final_claim_to_outcome": 0.005053
+          },
+          {
+            "id": "088807ee-a4fa-4132-abb5-91bf567ce998",
+            "submission_index": 286,
+            "recovery": 0.911974,
+            "backoff": 0.8759,
+            "due_to_claim": 0.028148,
+            "final_claim_to_outcome": 0.007926
+          },
+          {
+            "id": "bef758ad-7ec7-479d-ba51-ee651bf8cc8b",
+            "submission_index": 287,
+            "recovery": 0.904621,
+            "backoff": 0.857687,
+            "due_to_claim": 0.03887,
+            "final_claim_to_outcome": 0.008064
+          },
+          {
+            "id": "a62fef57-3a74-46ea-8848-d2c7c18c278f",
+            "submission_index": 294,
+            "recovery": 0.680056,
+            "backoff": 0.644366,
+            "due_to_claim": 0.027218,
+            "final_claim_to_outcome": 0.008472
+          }
+        ]
+      }
+    },
+    {
+      "run_number": 6,
+      "repetition": 3,
+      "cohort": "exhaustion_control",
+      "worker_concurrency": 5,
+      "raw_file": "run-06.json",
+      "complete": true,
+      "seed": 20261012,
+      "fault_indices": [
+        0,
+        4,
+        22,
+        25,
+        32,
+        35,
+        38,
+        42,
+        48,
+        58,
+        65,
+        87,
+        113,
+        117,
+        119,
+        141,
+        149,
+        161,
+        175,
+        201,
+        208,
+        223,
+        230,
+        271,
+        276,
+        279,
+        284,
+        286,
+        287,
+        294
+      ],
+      "max_attempts": 1,
+      "summary": {
+        "jobs": 300,
+        "injected_faults": 30,
+        "initially_succeeded": 270,
+        "eventually_succeeded": 270,
+        "dead_lettered": 30,
+        "permanently_failed": 0,
+        "unexpected_failures": 0,
+        "attempts": 300,
+        "failed_attempts": 30,
+        "automatic_retry_intents": 0,
+        "automatic_retry_executions": 0,
+        "automatic_retries": 0,
+        "outbox": 300,
+        "attempts_per_job_mean": 1.0,
+        "attempts_per_job_counts": {
+          "1": 300,
+          "2": 0
+        },
+        "initial_success_rate": 0.9,
+        "eventual_success_rate": 0.9,
+        "dead_letter_rate": 0.1,
+        "failed_attempt_rate": 0.1,
+        "generation": 0,
+        "accounting": {
+          "jobs": 300,
+          "injected_faults": 30,
+          "initially_succeeded": 270,
+          "eventually_succeeded": 270,
+          "dead_lettered": 30,
+          "permanently_failed": 0,
+          "unexpected_failures": 0,
+          "attempts": 300,
+          "failed_attempts": 30,
+          "automatic_retry_intents": 0,
+          "automatic_retry_executions": 0,
+          "automatic_retries": 0,
+          "outbox": 300,
+          "attempts_per_job_mean": 1.0,
+          "attempts_per_job_counts": {
+            "1": 300,
+            "2": 0
+          },
+          "initial_success_rate": 0.9,
+          "eventual_success_rate": 0.9,
+          "dead_letter_rate": 0.1,
+          "failed_attempt_rate": 0.1,
+          "generation": 0
+        },
+        "window_seconds": 3.0602590999915265,
+        "timing_seconds": {
+          "request": {
+            "count": 300,
+            "p50": 0.027134400006616488,
+            "p95": 0.07156309997662902,
+            "p99": 0.10822280001593754
+          },
+          "successful_lifecycle": {
+            "count": 270,
+            "p50": 1.658231,
+            "p95": 1.99673,
+            "p99": 2.03696
+          },
+          "client_observed_completion": {
+            "count": 300,
+            "p50": 1.7137466999993194,
+            "p95": 2.0551896000106353,
+            "p99": 2.085318199999165
+          },
+          "recovery": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "backoff": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "due_to_claim": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          },
+          "final_claim_to_outcome": {
+            "count": 0,
+            "p50": null,
+            "p95": null,
+            "p99": null
+          }
+        },
+        "recovery_samples": []
+      }
+    }
+  ],
+  "configuration": {
+    "jobs_per_cohort": 300,
+    "repetitions": 3,
+    "cohorts": {
+      "recovery": 3,
+      "exhaustion_control": 1
+    },
+    "worker_concurrency": 5,
+    "submission_concurrency": 10,
+    "poll_interval_seconds": 0.05,
+    "first_seed": 20261010,
+    "repetition_seeds": [
+      20261010,
+      20261011,
+      20261012
+    ],
+    "fault_fraction": 0.1,
+    "seeded_component": "fault-index membership only",
+    "handler": "controlled_failure",
+    "injected_fail_until_attempt": 1,
+    "unfaulted_fail_until_attempt": 0,
+    "priority": 0,
+    "warmup": false,
+    "retry_policy": {
+      "base_seconds": 1,
+      "max_seconds": 1,
+      "first_backoff_seconds_min": 0.5,
+      "first_backoff_seconds_max": 1
+    },
+    "run_timeout_seconds": 60,
+    "suite_timeout_seconds": 900,
+    "resource_limits": {
+      "database": {
+        "cpus": 2,
+        "memory_bytes": 536870912
+      },
+      "api": {
+        "cpus": 1,
+        "memory_bytes": 268435456
+      },
+      "worker": {
+        "cpus": 1,
+        "memory_bytes": 268435456
+      }
+    },
+    "worker_database_pool": {
+      "pool_size": 5,
+      "max_overflow": 10
+    },
+    "completion_observation": "private PostgreSQL status polling"
+  },
+  "commands": {
+    "invocation": [
+      "C:\\Users\\RTX\\Documents\\GitHub\\Distributed-Cloud-Scheduler\\.venv\\Scripts\\python.exe",
+      "scripts/local_reliability.py",
+      "--output",
+      "docs/reliability/raw/2026-10-10"
+    ],
+    "migration": [
+      "distributed-cloud-scheduler:local",
+      "alembic",
+      "upgrade",
+      "head"
+    ],
+    "worker": [
+      "distributed-cloud-scheduler:local",
+      "python",
+      "-m",
+      "distributed_cloud_scheduler.worker"
+    ]
+  },
+  "limitations": [
+    "Controlled handler failures only; no broker DLQ, crash, outage or cloud claim.",
+    "READY outboxes are unpublished durable intent, not broker delivery evidence.",
+    "Fault membership is seeded; UUIDs, runtime equal jitter and timings vary.",
+    "PostgreSQL timestamps precede commits; observed completion includes polling delay.",
+    "Job.started_at is the last attempt; initial outcome and recovery use attempt history.",
+    "Only 30 recovery samples per default recovery run; p99 is the observed maximum.",
+    "Finite local cohorts establish no SLA or universal recovery guarantee."
+  ],
+  "environment": {
+    "host": {
+      "os": "Windows-11-10.0.26300-SP0",
+      "python": "3.13.1",
+      "architecture": "AMD64",
+      "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+      "logical_cpus": 20,
+      "driver_dependencies": {
+        "httpx": "0.28.1",
+        "SQLAlchemy": "2.0.54",
+        "psycopg": "3.3.6"
+      },
+      "physical_cores": 14,
+      "cpu": "Intel(R) Core(TM) i5-14600KF",
+      "memory_bytes": 34055766016
+    },
+    "docker": {
+      "server_version": "28.5.1",
+      "os": "Docker Desktop",
+      "kernel": "6.6.87.2-microsoft-standard-WSL2",
+      "architecture": "x86_64",
+      "cpus": 20,
+      "memory_bytes": 16616943616,
+      "endpoint_kind": "local_named_pipe"
+    },
+    "images": {
+      "distributed-cloud-scheduler:local": "sha256:ed9968c8a8c47b3a03846685cb6b9bc1022f17fa53f9d44d8ee50033d9a9f160",
+      "postgres:17": "sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f"
+    },
+    "runtime": {
+      "python": "3.12.15",
+      "source_sha256": {
+        "__init__.py": "85e7a0864230a68e1aaf20cd8a212ac0aaee9e4bb9cc2a4df2d6f4e444e79625",
+        "__main__.py": "409af6603a26ca7a6166765af62e4f24e05d658a963dae33271a0f58a57b7992",
+        "api.py": "adb787c3e1928074571220840ac78e0003fbf4db98aa7571b337df87cc320b21",
+        "attempts.py": "eb2e86373dc78b24ec0021dc7bccb00f1a487b1fac855369866079e057ff7aa8",
+        "config.py": "fd1c008b626ba336595a8b8558b6ababa6addb25a981989ed55c39aed2879dcd",
+        "database.py": "b3708e7d5966dc26b4db95637fdaf884cb91386b38a9f658b82bdaaca0bdfee9",
+        "dispatcher.py": "ba8e6257d856577de1afdd01343f1017d61042277e4befc9b5c81dc6cf343bec",
+        "execution.py": "4a700f7aa0d889ad25147a59477aa623e60dad2fa02293a47fc2d4036fd0cb23",
+        "idempotency.py": "b2a11ecc5b14728452e52438aa0c8b3d5de480f08626d672e05e89e10d1ad111",
+        "jobs.py": "c5de74896682a90c9b02cbe86f1ea23cee8205cbb9ecbefeeda22e01a7031636",
+        "manual_retry.py": "65050fe5bb39b2eb2db0fb6f5557520fe88813c1f1f9e284db102982254e8899",
+        "messaging.py": "8674d77e2893342b455cbbc81b1b12949deb2feec831a077f79149f75f552f10",
+        "observability.py": "ac28f088d87bfa61c95999590ebe26aaee6715fb241f29f58fee1da93525adcd",
+        "outbox.py": "58fbb629b36abf64742fd98b14a2156ce99a2ef69b64d99ab29b63c0bf7db455",
+        "priority.py": "705af1c9ef3dd1faed39152079cb6f7b443443e08707a5bc303323ba71bc8bb4",
+        "pubsub.py": "ff84efa2b3d9bc951509c1e1aba1b29b35f44b232fe98c21ddea84a45d174cbc",
+        "pubsub_config.py": "9c11f38c6263b83a4198b29cebb755968e99ca721e768bece04070635209dbd5",
+        "push.py": "00df258f7d81da56ef8ecfd7be76c54831bfbf54a880b4cf5ad8ac24f08ffe1e",
+        "retries.py": "f650f7361720dc4ba1f78187ea608bb86077d19de3b6f3f34e1ef303249f9320",
+        "scheduler.py": "52da078ccd907109fe1a341081497846940892a6716d7223601078ddbdc5d3c0",
+        "tasks.py": "84c1c3555c6f21bdaf93250c2b4360cd5d5d50f7178a2f8c36cb998c7bd23471",
+        "worker.py": "1263462a3b8bfd5b6d40a69a11c522d718a64d5e1c58f5f61f1ba04ac8b09442"
+      },
+      "dependencies": {
+        "distributed-cloud-scheduler": "0.1.0",
+        "fastapi": "0.143.0",
+        "pydantic": "2.14.0",
+        "SQLAlchemy": "2.0.54",
+        "psycopg": "3.3.6",
+        "alembic": "1.20.0",
+        "uvicorn": "0.54.0"
+      }
+    },
+    "source_git_revision": "20197064f1d8e8c453056c83634cf3317dda8d27",
+    "checkout_dirty": true,
+    "helper_harness_sha256": "11692842eb420e36609cf0ef00bbdbe3095061569a5daf714a2e14530cee0d49",
+    "harness_sha256": "ec283324aaf154e6f38da339401a53da0597af5389bf603371bdef465e7ab78b",
+    "postgres_version": "17.11 (Debian 17.11-1.pgdg13+2)",
+    "migration_revision": "0009"
+  },
+  "owned_resources": {
+    "network": "dcbenchmark-b6dfb14b3834",
+    "containers": {
+      "api": "dcbenchmark-b6dfb14b3834-api",
+      "worker": "dcbenchmark-b6dfb14b3834-worker",
+      "database": "dcbenchmark-b6dfb14b3834-database"
+    }
+  },
+  "loopback_ports": {
+    "database": 51426,
+    "api": 51427
+  },
+  "measurement_finished_at": "2026-10-10T12:47:36.464290+00:00",
+  "ownership": {
+    "owner": "b6dfb14b3834",
+    "network": "dcbenchmark-b6dfb14b3834",
+    "tracked_containers_before_cleanup": [
+      "dcbenchmark-b6dfb14b3834-database",
+      "dcbenchmark-b6dfb14b3834-api",
+      "dcbenchmark-b6dfb14b3834-worker"
+    ]
+  },
+  "cleanup_complete": true,
+  "cleanup": [
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-preflight",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-migrate",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-worker",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-worker",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-worker",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-worker",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-worker",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-worker",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-api",
+      "removed": true
+    },
+    {
+      "kind": "container",
+      "name": "dcbenchmark-b6dfb14b3834-database",
+      "removed": true
+    },
+    {
+      "kind": "network",
+      "name": "dcbenchmark-b6dfb14b3834",
+      "removed": true
+    }
+  ],
+  "remaining_owned_resources": {
+    "containers": [],
+    "network": null
+  },
+  "finished_at": "2026-10-10T12:47:39.258567+00:00"
+}
