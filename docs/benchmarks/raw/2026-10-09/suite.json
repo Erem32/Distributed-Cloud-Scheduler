@@ -1061,7 +1061,7 @@
   },
   "commands": {
     "invocation": [
-      "C:\\Users\\RTX\\Documents\\GitHub\\Distributed-Cloud-Scheduler\\.venv\\Scripts\\python.exe",
+      ".venv/Scripts/python.exe",
       "scripts/local_benchmark.py",
       "--output",
       "docs/benchmarks/raw/2026-10-09"
@@ -3001,5 +3001,8 @@
     "containers": [],
     "network": null
   },
-  "finished_at": "2026-10-09T17:42:47.938633+00:00"
+  "finished_at": "2026-10-09T17:42:47.938633+00:00",
+  "publication_redactions": {
+    "commands.invocation[0]": "Absolute host interpreter path replaced with project-relative virtual-environment path. Measured records are unchanged."
+  }
 }

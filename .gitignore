@@ -4,6 +4,28 @@ venv/
 .env
 .env.*
 !.env.example
+*.env
+
+# Private credential files
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+credentials*.json
+service-account*.json
+application_default_credentials.json
+
+# Local experiment output; published raw evidence lives under docs/
+benchmark-results/
+reliability-results/
+
+# Local assistant state and unpublished Markdown
+.codex/
+.claude/
+.agents/
+*.[mM][dD]
+!/README.md
 
 # Python artifacts and verification caches
 __pycache__/
